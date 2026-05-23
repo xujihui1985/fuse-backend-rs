@@ -79,6 +79,10 @@ impl InodeStore {
         inode: Inode,
         path_removed: Option<String>,
     ) -> Option<Arc<OverlayInode>> {
+        if let Some(path) = path_removed.as_ref() {
+            self.path_mapping.remove(path);
+        }
+
         let removed = match self.inodes.remove(&inode) {
             Some(v) => {
                 // Refcount is not 0, we have to delay the removal.
@@ -105,9 +109,6 @@ impl InodeStore {
             }
         };
 
-        if let Some(path) = path_removed {
-            self.path_mapping.remove(&path);
-        }
         removed
     }
 

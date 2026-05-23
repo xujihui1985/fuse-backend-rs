@@ -590,23 +590,32 @@ impl FileSystem for OverlayFs {
 
     fn rename(
         &self,
-        _ctx: &Context,
-        _olddir: Inode,
-        _odlname: &CStr,
-        _newdir: Inode,
-        _newname: &CStr,
-        _flags: u32,
+        ctx: &Context,
+        olddir: Inode,
+        oldname: &CStr,
+        newdir: Inode,
+        newname: &CStr,
+        flags: u32,
     ) -> Result<()> {
-        // complex, implement it later
+        let oldname = oldname.to_string_lossy().to_string();
+        let newname = newname.to_string_lossy().to_string();
         trace!(
             "RENAME: olddir: {}, oldname: {}, newdir: {}, newname: {}, flags: {}\n",
-            _olddir,
-            _odlname.to_string_lossy(),
-            _newdir,
-            _newname.to_string_lossy(),
-            _flags
+            olddir,
+            oldname,
+            newdir,
+            newname,
+            flags
         );
-        Err(Error::from_raw_os_error(libc::EXDEV))
+
+        self.do_rename(
+            ctx,
+            olddir,
+            oldname.as_str(),
+            newdir,
+            newname.as_str(),
+            flags,
+        )
     }
 
     fn mknod(

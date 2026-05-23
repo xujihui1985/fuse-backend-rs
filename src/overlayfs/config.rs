@@ -5,6 +5,13 @@ use self::super::CachePolicy;
 use std::fmt;
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WhiteoutMode {
+    #[default]
+    OverlayFs,
+    Nydus,
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct Config {
     pub mountpoint: String,
@@ -18,6 +25,7 @@ pub struct Config {
     pub no_readdir: bool,
     pub perfile_dax: bool,
     pub cache_policy: CachePolicy,
+    pub whiteout_mode: WhiteoutMode,
     pub attr_timeout: Duration,
     pub entry_timeout: Duration,
 }

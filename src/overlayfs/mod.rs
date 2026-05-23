@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use crate::abi::fuse_abi::{stat64, statvfs64, CreateIn, ROOT_ID as FUSE_ROOT_ID};
 use crate::api::filesystem::{
-    Context, DirEntry, Entry, Layer, OpenOptions, ZeroCopyReader, ZeroCopyWriter,
+    Context, DirEntry, Entry, GetxattrReply, Layer, OpenOptions, ZeroCopyReader, ZeroCopyWriter,
 };
 #[cfg(not(feature = "async-io"))]
 use crate::api::BackendFileSystem;
@@ -27,7 +27,7 @@ use crate::common::file_buf::FileVolatileSlice;
 use crate::common::file_traits::FileReadWriteVolatile;
 use vmm_sys_util::tempfile::TempFile;
 
-use self::config::Config;
+use self::config::{Config, WhiteoutMode};
 use self::inode_store::InodeStore;
 
 pub type Inode = u64;
@@ -36,6 +36,8 @@ pub const MAXNAMELEN: usize = 256;
 pub const CURRENT_DIR: &str = ".";
 pub const PARENT_DIR: &str = "..";
 pub const MAXBUFSIZE: usize = 1 << 20;
+const NYDUS_WHITEOUT_XATTR: &str = "user.nydus.overlay.whiteout";
+const NYDUS_WHITEOUT_XATTR_VALUE: &[u8] = b"y";
 
 //type BoxedFileSystem = Box<dyn FileSystem<Inode = Inode, Handle = Handle> + Send + Sync>;
 pub type BoxedLayer = Box<dyn Layer<Inode = Inode, Handle = Handle> + Send + Sync>;
@@ -194,7 +196,12 @@ impl RealInode {
 
     // Find child inode in same layer under this directory(Self).
     // Return None if not found.
-    fn lookup_child(&self, ctx: &Context, name: &str) -> Result<Option<RealInode>> {
+    fn lookup_child(
+        &self,
+        ctx: &Context,
+        name: &str,
+        whiteout_mode: WhiteoutMode,
+    ) -> Result<Option<RealInode>> {
         if self.whiteout {
             return Ok(None);
         }
@@ -205,10 +212,11 @@ impl RealInode {
         match self.lookup_child_ignore_enoent(ctx, name)? {
             Some(v) => {
                 // The Entry must be forgotten in each layer, which will be done automatically by Drop operation.
-                let (whiteout, opaque) = if utils::is_dir(v.attr) {
-                    (false, layer.is_opaque(ctx, v.inode)?)
+                let whiteout = self.is_whiteout_entry(ctx, v.inode, v.attr, whiteout_mode)?;
+                let opaque = if !whiteout && utils::is_dir(v.attr) {
+                    layer.is_opaque(ctx, v.inode)?
                 } else {
-                    (layer.is_whiteout(ctx, v.inode)?, false)
+                    false
                 };
 
                 Ok(Some(RealInode {
@@ -225,7 +233,11 @@ impl RealInode {
     }
 
     // Read directory entries from specific RealInode, error out if it's not directory.
-    fn readdir(&self, ctx: &Context) -> Result<HashMap<String, RealInode>> {
+    fn readdir(
+        &self,
+        ctx: &Context,
+        whiteout_mode: WhiteoutMode,
+    ) -> Result<HashMap<String, RealInode>> {
         // Deleted inode should not be read.
         if self.whiteout {
             return Err(Error::from_raw_os_error(libc::ENOENT));
@@ -316,7 +328,7 @@ impl RealInode {
         // Lookup all child and construct "RealInode"s.
         let mut child_real_inodes = HashMap::new();
         for name in child_names {
-            if let Some(child) = self.lookup_child(ctx, name.as_str())? {
+            if let Some(child) = self.lookup_child(ctx, name.as_str(), whiteout_mode)? {
                 child_real_inodes.insert(name, child);
             }
         }
@@ -324,7 +336,60 @@ impl RealInode {
         Ok(child_real_inodes)
     }
 
-    fn create_whiteout(&self, ctx: &Context, name: &str) -> Result<RealInode> {
+    fn is_whiteout_entry(
+        &self,
+        ctx: &Context,
+        inode: Inode,
+        attr: stat64,
+        whiteout_mode: WhiteoutMode,
+    ) -> Result<bool> {
+        match whiteout_mode {
+            WhiteoutMode::OverlayFs => self.layer.is_whiteout(ctx, inode),
+            WhiteoutMode::Nydus => {
+                if utils::is_dir(attr) {
+                    Ok(false)
+                } else {
+                    self.has_nydus_whiteout_xattr(ctx, inode)
+                }
+            }
+        }
+    }
+
+    fn has_nydus_whiteout_xattr(&self, ctx: &Context, inode: Inode) -> Result<bool> {
+        let cname = utils::to_cstring(NYDUS_WHITEOUT_XATTR)?;
+        match self.layer.getxattr(
+            ctx,
+            inode,
+            cname.as_c_str(),
+            NYDUS_WHITEOUT_XATTR_VALUE.len() as u32,
+        ) {
+            Ok(GetxattrReply::Value(value)) => Ok(value == NYDUS_WHITEOUT_XATTR_VALUE),
+            Ok(GetxattrReply::Count(_)) => Ok(false),
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENODATA) => Ok(false),
+                _ => Err(e),
+            },
+        }
+    }
+
+    fn create_whiteout(
+        &self,
+        ctx: &Context,
+        name: &str,
+        whiteout_mode: WhiteoutMode,
+    ) -> Result<RealInode> {
+        match whiteout_mode {
+            WhiteoutMode::OverlayFs => self.create_overlayfs_whiteout(ctx, name, true),
+            WhiteoutMode::Nydus => self.create_nydus_whiteout(ctx, name),
+        }
+    }
+
+    fn create_overlayfs_whiteout(
+        &self,
+        ctx: &Context,
+        name: &str,
+        hidden: bool,
+    ) -> Result<RealInode> {
         if !self.in_upper_layer {
             return Err(Error::from_raw_os_error(libc::EROFS));
         }
@@ -339,10 +404,112 @@ impl RealInode {
             layer: self.layer.clone(),
             in_upper_layer: true,
             inode: entry.inode,
-            whiteout: true,
+            whiteout: hidden,
             opaque: false,
             stat: Some(entry.attr),
         })
+    }
+
+    fn create_nydus_whiteout(&self, ctx: &Context, name: &str) -> Result<RealInode> {
+        if !self.in_upper_layer {
+            return Err(Error::from_raw_os_error(libc::EROFS));
+        }
+
+        let cname = utils::to_cstring(name)?;
+        let layer = self.layer.as_ref();
+        match layer.lookup(ctx, self.inode, cname.as_c_str()) {
+            Ok(entry) => {
+                let whiteout =
+                    self.is_whiteout_entry(ctx, entry.inode, entry.attr, WhiteoutMode::Nydus)?;
+                if whiteout {
+                    return Ok(RealInode {
+                        layer: self.layer.clone(),
+                        in_upper_layer: true,
+                        inode: entry.inode,
+                        whiteout: true,
+                        opaque: false,
+                        stat: Some(entry.attr),
+                    });
+                }
+                layer.forget(ctx, entry.inode, 1);
+                Err(Error::from_raw_os_error(libc::EEXIST))
+            }
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENOENT) => {
+                    let entry = layer.mknod(
+                        ctx,
+                        self.inode,
+                        cname.as_c_str(),
+                        libc::S_IFREG | 0o000,
+                        0,
+                        0,
+                    )?;
+                    let xattr = utils::to_cstring(NYDUS_WHITEOUT_XATTR)?;
+                    if let Err(e) = layer.setxattr(
+                        ctx,
+                        entry.inode,
+                        xattr.as_c_str(),
+                        NYDUS_WHITEOUT_XATTR_VALUE,
+                        0,
+                    ) {
+                        let _ = layer.unlink(ctx, self.inode, cname.as_c_str());
+                        layer.forget(ctx, entry.inode, 1);
+                        return Err(e);
+                    }
+
+                    Ok(RealInode {
+                        layer: self.layer.clone(),
+                        in_upper_layer: true,
+                        inode: entry.inode,
+                        whiteout: true,
+                        opaque: false,
+                        stat: Some(entry.attr),
+                    })
+                }
+                _ => Err(e),
+            },
+        }
+    }
+
+    fn delete_whiteout(
+        &self,
+        ctx: &Context,
+        name: &str,
+        whiteout_mode: WhiteoutMode,
+    ) -> Result<()> {
+        match whiteout_mode {
+            WhiteoutMode::OverlayFs => {
+                let cname = utils::to_cstring(name)?;
+                self.layer
+                    .delete_whiteout(ctx, self.inode, cname.as_c_str())
+            }
+            WhiteoutMode::Nydus => self.delete_nydus_whiteout(ctx, name),
+        }
+    }
+
+    fn delete_nydus_whiteout(&self, ctx: &Context, name: &str) -> Result<()> {
+        if !self.in_upper_layer {
+            return Err(Error::from_raw_os_error(libc::EROFS));
+        }
+
+        let cname = utils::to_cstring(name)?;
+        let layer = self.layer.as_ref();
+        match layer.lookup(ctx, self.inode, cname.as_c_str()) {
+            Ok(entry) => {
+                let is_whiteout =
+                    self.is_whiteout_entry(ctx, entry.inode, entry.attr, WhiteoutMode::Nydus)?;
+                layer.forget(ctx, entry.inode, 1);
+                if is_whiteout {
+                    layer.unlink(ctx, self.inode, cname.as_c_str())
+                } else {
+                    Err(Error::from_raw_os_error(libc::EINVAL))
+                }
+            }
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENOENT) => Ok(()),
+                _ => Err(e),
+            },
+        }
     }
 
     fn mkdir(&self, ctx: &Context, name: &str, mode: u32, umask: u32) -> Result<RealInode> {
@@ -609,7 +776,11 @@ impl OverlayInode {
     }
 
     // Self is directory, fill all childrens.
-    pub fn scan_childrens(self: &Arc<Self>, ctx: &Context) -> Result<Vec<OverlayInode>> {
+    pub fn scan_childrens(
+        self: &Arc<Self>,
+        ctx: &Context,
+        whiteout_mode: WhiteoutMode,
+    ) -> Result<Vec<OverlayInode>> {
         let st = self.stat64(ctx)?;
         if !utils::is_dir(st) {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
@@ -647,7 +818,7 @@ impl OverlayInode {
             }
 
             // Read all entries from one layer.
-            let entries = ri.readdir(ctx)?;
+            let entries = ri.readdir(ctx, whiteout_mode)?;
 
             // Merge entries from one layer to all_layer_inodes.
             for (name, inode) in entries {
@@ -789,6 +960,22 @@ impl OverlayInode {
         }
     }
 
+    fn upper_inode_info(&self) -> Result<(Arc<BoxedLayer>, u64, bool)> {
+        let all_inodes = self.real_inodes.lock().unwrap();
+        let first = all_inodes.first().ok_or_else(|| {
+            Error::other(format!(
+                "BUG: dangling OverlayInode {} without any backend inode",
+                self.inode
+            ))
+        })?;
+
+        if !first.in_upper_layer {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        Ok((first.layer.clone(), first.inode, first.opaque))
+    }
+
     pub fn child(&self, name: &str) -> Option<Arc<OverlayInode>> {
         self.childrens.lock().unwrap().get(name).cloned()
     }
@@ -863,6 +1050,55 @@ impl OverlayFs {
 
     pub fn root_inode(&self) -> Inode {
         FUSE_ROOT_ID
+    }
+
+    fn has_nydus_whiteout_xattr(
+        &self,
+        ctx: &Context,
+        layer: &Arc<BoxedLayer>,
+        inode: Inode,
+    ) -> Result<bool> {
+        let cname = utils::to_cstring(NYDUS_WHITEOUT_XATTR)?;
+        match layer.getxattr(
+            ctx,
+            inode,
+            cname.as_c_str(),
+            NYDUS_WHITEOUT_XATTR_VALUE.len() as u32,
+        ) {
+            Ok(GetxattrReply::Value(value)) => Ok(value == NYDUS_WHITEOUT_XATTR_VALUE),
+            Ok(GetxattrReply::Count(_)) => Ok(false),
+            Err(e) => match e.raw_os_error() {
+                Some(libc::ENODATA) => Ok(false),
+                _ => Err(e),
+            },
+        }
+    }
+
+    fn delete_whiteout_from_layer(
+        &self,
+        ctx: &Context,
+        layer: &Arc<BoxedLayer>,
+        parent: Inode,
+        name: &CStr,
+    ) -> Result<()> {
+        match self.config.whiteout_mode {
+            WhiteoutMode::OverlayFs => layer.delete_whiteout(ctx, parent, name),
+            WhiteoutMode::Nydus => match layer.lookup(ctx, parent, name) {
+                Ok(entry) => {
+                    let is_whiteout = self.has_nydus_whiteout_xattr(ctx, layer, entry.inode)?;
+                    layer.forget(ctx, entry.inode, 1);
+                    if is_whiteout {
+                        layer.unlink(ctx, parent, name)
+                    } else {
+                        Err(Error::from_raw_os_error(libc::EINVAL))
+                    }
+                }
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::ENOENT) => Ok(()),
+                    _ => Err(e),
+                },
+            },
+        }
     }
 
     fn alloc_inode(&self, path: &String) -> Result<u64> {
@@ -1012,7 +1248,7 @@ impl OverlayFs {
         }
 
         // We got all childrens without inode.
-        let childrens = node.scan_childrens(ctx)?;
+        let childrens = node.scan_childrens(ctx, self.config.whiteout_mode)?;
 
         // =============== Start Lock Area ===================
         // Lock OverlayFs inodes.
@@ -1283,11 +1519,7 @@ impl OverlayFs {
             };
 
             if delete_whiteout {
-                let _ = parent_real_inode.layer.delete_whiteout(
-                    ctx,
-                    parent_real_inode.inode,
-                    utils::to_cstring(name)?.as_c_str(),
-                );
+                let _ = parent_real_inode.delete_whiteout(ctx, name, self.config.whiteout_mode);
             }
             // Allocate inode number.
             let ino = self.alloc_inode(&path)?;
@@ -1346,11 +1578,8 @@ impl OverlayFs {
                     };
 
                     if n.in_upper_layer() {
-                        let _ = parent_real_inode.layer.delete_whiteout(
-                            ctx,
-                            parent_real_inode.inode,
-                            utils::to_cstring(name)?.as_c_str(),
-                        );
+                        let _ =
+                            parent_real_inode.delete_whiteout(ctx, name, self.config.whiteout_mode);
                     }
 
                     let child_ri = parent_real_inode.mknod(ctx, name, mode, rdev, umask)?;
@@ -1432,11 +1661,8 @@ impl OverlayFs {
                     };
 
                     if n.in_upper_layer() {
-                        let _ = parent_real_inode.layer.delete_whiteout(
-                            ctx,
-                            parent_real_inode.inode,
-                            utils::to_cstring(name)?.as_c_str(),
-                        );
+                        let _ =
+                            parent_real_inode.delete_whiteout(ctx, name, self.config.whiteout_mode);
                     }
 
                     let (child_ri, hd) = parent_real_inode.create(ctx, name, args)?;
@@ -1555,11 +1781,8 @@ impl OverlayFs {
 
                     // Whiteout file exists in upper level, let's delete it.
                     if n.in_upper_layer() {
-                        let _ = parent_real_inode.layer.delete_whiteout(
-                            ctx,
-                            parent_real_inode.inode,
-                            utils::to_cstring(name)?.as_c_str(),
-                        );
+                        let _ =
+                            parent_real_inode.delete_whiteout(ctx, name, self.config.whiteout_mode);
                     }
 
                     let child_ri = parent_real_inode.link(ctx, src_ino, name)?;
@@ -1601,6 +1824,234 @@ impl OverlayFs {
         Ok(())
     }
 
+    fn do_rename(
+        &self,
+        ctx: &Context,
+        olddir: Inode,
+        oldname: &str,
+        newdir: Inode,
+        newname: &str,
+        flags: u32,
+    ) -> Result<()> {
+        if self.upper_layer.is_none() {
+            return Err(Error::from_raw_os_error(libc::EROFS));
+        }
+
+        let supported_flags = libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT;
+        let noreplace = flags & libc::RENAME_NOREPLACE != 0;
+        let rename_whiteout = flags & libc::RENAME_WHITEOUT != 0;
+        if flags & !supported_flags != 0 {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        if oldname == CURRENT_DIR
+            || oldname == PARENT_DIR
+            || newname == CURRENT_DIR
+            || newname == PARENT_DIR
+        {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        let old_parent = self.lookup_node(ctx, olddir, "")?;
+        let new_parent = self.lookup_node(ctx, newdir, "")?;
+        if old_parent.whiteout.load(Ordering::Relaxed)
+            || new_parent.whiteout.load(Ordering::Relaxed)
+        {
+            return Err(Error::from_raw_os_error(libc::ENOENT));
+        }
+
+        let old_node = self.lookup_node(ctx, olddir, oldname)?;
+        if old_node.whiteout.load(Ordering::Relaxed) {
+            return Err(Error::from_raw_os_error(libc::ENOENT));
+        }
+
+        if olddir == newdir && oldname == newname {
+            if rename_whiteout {
+                return Err(Error::from_raw_os_error(libc::EINVAL));
+            }
+
+            return if noreplace {
+                Err(Error::from_raw_os_error(libc::EEXIST))
+            } else {
+                Ok(())
+            };
+        }
+
+        let old_st = old_node.stat64(ctx)?;
+        let old_is_dir = utils::is_dir(old_st);
+        if old_is_dir {
+            if !old_node.upper_layer_only() {
+                // Rename of lower or merged directories requires redirect_dir support.
+                return Err(Error::from_raw_os_error(libc::EXDEV));
+            }
+
+            let child_prefix = format!("{}/", old_node.path);
+            if new_parent.inode == old_node.inode || new_parent.path.starts_with(&child_prefix) {
+                return Err(Error::from_raw_os_error(libc::EINVAL));
+            }
+        }
+
+        let target_node = self.lookup_node_ignore_enoent(ctx, newdir, newname)?;
+        let mut target_needs_opaque = false;
+        let mut target_is_upper_whiteout = false;
+        let mut target_is_whiteout = false;
+        if let Some(ref target) = target_node {
+            target_is_whiteout = target.whiteout.load(Ordering::Relaxed);
+            target_is_upper_whiteout = target_is_whiteout && target.in_upper_layer();
+
+            if !target_is_whiteout {
+                if noreplace {
+                    return Err(Error::from_raw_os_error(libc::EEXIST));
+                }
+
+                let target_st = target.stat64(ctx)?;
+                let target_is_dir = utils::is_dir(target_st);
+                if old_is_dir && !target_is_dir {
+                    return Err(Error::from_raw_os_error(libc::ENOTDIR));
+                }
+                if !old_is_dir && target_is_dir {
+                    return Err(Error::from_raw_os_error(libc::EISDIR));
+                }
+                if old_is_dir {
+                    self.load_directory(ctx, target)?;
+                    let (entries, _) = target.count_entries_and_whiteout(ctx)?;
+                    if entries > 0 {
+                        return Err(Error::from_raw_os_error(libc::ENOTEMPTY));
+                    }
+                    target_needs_opaque = !target.upper_layer_only();
+                }
+            }
+        }
+
+        let old_needs_whiteout = rename_whiteout || !old_node.upper_layer_only();
+
+        let old_parent = self.copy_node_up(ctx, old_parent)?;
+        let new_parent = if olddir == newdir {
+            Arc::clone(&old_parent)
+        } else {
+            self.copy_node_up(ctx, new_parent)?
+        };
+        let old_node = self.copy_node_up(ctx, old_node)?;
+
+        let (old_layer, old_parent_inode, old_parent_opaque) = old_parent.upper_inode_info()?;
+        let (new_layer, new_parent_inode, _) = new_parent.upper_inode_info()?;
+
+        let old_cname = utils::to_cstring(oldname)?;
+        let new_cname = utils::to_cstring(newname)?;
+
+        if old_is_dir && target_is_upper_whiteout {
+            self.delete_whiteout_from_layer(
+                ctx,
+                &new_layer,
+                new_parent_inode,
+                new_cname.as_c_str(),
+            )?;
+        }
+
+        let real_flags = if target_is_whiteout {
+            flags & !(libc::RENAME_NOREPLACE | libc::RENAME_WHITEOUT)
+        } else {
+            flags & !libc::RENAME_WHITEOUT
+        };
+        old_layer.rename(
+            ctx,
+            old_parent_inode,
+            old_cname.as_c_str(),
+            new_parent_inode,
+            new_cname.as_c_str(),
+            real_flags,
+        )?;
+
+        let moved_entry = new_layer.lookup(ctx, new_parent_inode, new_cname.as_c_str())?;
+        if old_is_dir && target_needs_opaque {
+            new_layer.set_opaque(ctx, moved_entry.inode)?;
+        }
+        let moved_opaque = if utils::is_dir(moved_entry.attr) {
+            new_layer.is_opaque(ctx, moved_entry.inode)?
+        } else {
+            false
+        };
+        let moved_real_inode = RealInode {
+            layer: new_layer.clone(),
+            in_upper_layer: true,
+            inode: moved_entry.inode,
+            whiteout: false,
+            opaque: moved_opaque,
+            stat: Some(moved_entry.attr),
+        };
+
+        if let Some(target) = target_node {
+            target.lookups.fetch_sub(1, Ordering::Relaxed);
+            self.remove_inode(target.inode, Some(target.path.clone()));
+            new_parent.remove_child(newname);
+        }
+
+        old_node.lookups.fetch_sub(1, Ordering::Relaxed);
+        self.remove_inode(old_node.inode, Some(old_node.path.clone()));
+        old_parent.remove_child(oldname);
+
+        if old_needs_whiteout && (rename_whiteout || !old_parent_opaque) {
+            let whiteout_real_inode = if rename_whiteout {
+                let whiteout_entry =
+                    old_layer.create_whiteout(ctx, old_parent_inode, old_cname.as_c_str())?;
+                RealInode {
+                    layer: old_layer.clone(),
+                    in_upper_layer: true,
+                    inode: whiteout_entry.inode,
+                    whiteout: false,
+                    opaque: false,
+                    stat: Some(whiteout_entry.attr),
+                }
+            } else {
+                old_parent.handle_upper_inode_locked(&mut |parent_real_inode| -> Result<bool> {
+                    let parent_real_inode = parent_real_inode.ok_or_else(|| {
+                        error!("BUG: old parent doesn't have upper inode after copied up");
+                        Error::from_raw_os_error(libc::EINVAL)
+                    })?;
+                    let _ = parent_real_inode.create_whiteout(
+                        ctx,
+                        oldname,
+                        self.config.whiteout_mode,
+                    )?;
+                    Ok(false)
+                })?;
+                let whiteout_entry =
+                    old_layer.lookup(ctx, old_parent_inode, old_cname.as_c_str())?;
+                RealInode {
+                    layer: old_layer.clone(),
+                    in_upper_layer: true,
+                    inode: whiteout_entry.inode,
+                    whiteout: true,
+                    opaque: false,
+                    stat: Some(whiteout_entry.attr),
+                }
+            };
+            let whiteout_path = format!("{}/{}", old_parent.path, oldname);
+            let whiteout_inode = self.alloc_inode(&whiteout_path)?;
+            let mut whiteout_node = OverlayInode::new_from_real_inode(
+                oldname,
+                whiteout_inode,
+                whiteout_path,
+                whiteout_real_inode,
+            );
+            whiteout_node.parent = Mutex::new(Arc::downgrade(&old_parent));
+            let whiteout_node = Arc::new(whiteout_node);
+            self.insert_inode(whiteout_inode, whiteout_node.clone());
+            old_parent.insert_child(oldname, whiteout_node);
+        }
+
+        let moved_path = format!("{}/{}", new_parent.path, newname);
+        let moved_inode = self.alloc_inode(&moved_path)?;
+        let mut moved_node =
+            OverlayInode::new_from_real_inode(newname, moved_inode, moved_path, moved_real_inode);
+        moved_node.parent = Mutex::new(Arc::downgrade(&new_parent));
+        let moved_node = Arc::new(moved_node);
+        self.insert_inode(moved_inode, moved_node.clone());
+        new_parent.insert_child(newname, moved_node);
+
+        Ok(())
+    }
+
     fn do_symlink(
         &self,
         ctx: &Context,
@@ -1636,11 +2087,8 @@ impl OverlayFs {
                     };
 
                     if n.in_upper_layer() {
-                        let _ = parent_real_inode.layer.delete_whiteout(
-                            ctx,
-                            parent_real_inode.inode,
-                            utils::to_cstring(name)?.as_c_str(),
-                        );
+                        let _ =
+                            parent_real_inode.delete_whiteout(ctx, name, self.config.whiteout_mode);
                     }
 
                     let child_ri = parent_real_inode.symlink(ctx, linkname, name)?;
@@ -1960,7 +2408,11 @@ impl OverlayFs {
                     Error::from_raw_os_error(libc::EINVAL)
                 })?;
 
-                let child_ri = parent_real_inode.create_whiteout(ctx, sname.as_str())?;
+                let child_ri = parent_real_inode.create_whiteout(
+                    ctx,
+                    sname.as_str(),
+                    self.config.whiteout_mode,
+                )?;
                 let path = format!("{}/{}", pnode.path, sname);
                 let ino = self.alloc_inode(&path)?;
                 let ovi = Arc::new(OverlayInode::new_from_real_inode(
@@ -2032,8 +2484,9 @@ impl OverlayFs {
             // We only care about upper layer, ignore lower layers.
             if child.in_upper_layer() {
                 if child.whiteout.load(Ordering::Relaxed) {
-                    layer.delete_whiteout(
+                    self.delete_whiteout_from_layer(
                         ctx,
+                        &layer,
                         inode,
                         utils::to_cstring(child.name.as_str())?.as_c_str(),
                     )?

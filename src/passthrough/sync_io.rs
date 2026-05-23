@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io;
 use std::mem::{self, size_of, ManuallyDrop, MaybeUninit};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +28,126 @@ use crate::bytes_to_cstr;
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::transport::FsCacheReqHandler;
 
+static RENAME_WHITEOUT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
+    fn renameat2(
+        olddir_fd: RawFd,
+        oldname: &CStr,
+        newdir_fd: RawFd,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                olddir_fd,
+                oldname.as_ptr(),
+                newdir_fd,
+                newname.as_ptr(),
+                flags,
+            )
+        };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn rename_whiteout_unsupported(e: &io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+        )
+    }
+
+    fn emulate_rename_whiteout(
+        &self,
+        ctx: &Context,
+        olddir_fd: RawFd,
+        oldname: &CStr,
+        newdir_fd: RawFd,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        let final_flags = flags & !libc::RENAME_WHITEOUT;
+        let mut tmp_name = None;
+        for _ in 0..16 {
+            let id = RENAME_WHITEOUT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+            let candidate = CString::new(format!(
+                ".fuse_rename_whiteout_{}_{}",
+                std::process::id(),
+                id
+            ))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            match Self::renameat2(
+                olddir_fd,
+                oldname,
+                olddir_fd,
+                candidate.as_c_str(),
+                libc::RENAME_NOREPLACE,
+            ) {
+                Ok(()) => {
+                    tmp_name = Some(candidate);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        let tmp_name = tmp_name.ok_or_else(|| io::Error::from_raw_os_error(libc::EEXIST))?;
+        let rollback_source = |whiteout_created: bool| {
+            if whiteout_created {
+                // Best-effort cleanup. Return the original operation error to preserve semantics.
+                unsafe {
+                    libc::unlinkat(olddir_fd, oldname.as_ptr(), 0);
+                }
+            }
+
+            let _ = Self::renameat2(olddir_fd, tmp_name.as_c_str(), olddir_fd, oldname, 0);
+        };
+
+        let create_whiteout = {
+            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+            // Safe because this doesn't modify memory and the return value is checked.
+            unsafe {
+                libc::mknodat(
+                    olddir_fd,
+                    oldname.as_ptr(),
+                    (libc::S_IFCHR | 0o000) as libc::mode_t,
+                    libc::makedev(0, 0),
+                )
+            }
+        };
+        if create_whiteout < 0 {
+            let err = io::Error::last_os_error();
+            rollback_source(false);
+            return Err(err);
+        }
+
+        match Self::renameat2(
+            olddir_fd,
+            tmp_name.as_c_str(),
+            newdir_fd,
+            newname,
+            final_flags,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                rollback_source(true);
+                Err(e)
+            }
+        }
+    }
+
     fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
         let data = self.inode_map.get(inode)?;
         if !is_safe_inode(data.mode) {
@@ -881,7 +1000,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn rename(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         olddir: Inode,
         oldname: &CStr,
         newdir: Inode,
@@ -896,23 +1015,27 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let old_file = old_inode.get_file()?;
         let new_file = new_inode.get_file()?;
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
-        // and we have glibc 2.28.
-        let res = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                old_file.as_raw_fd(),
-                oldname.as_ptr(),
-                new_file.as_raw_fd(),
-                newname.as_ptr(),
-                flags,
-            )
-        };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        match Self::renameat2(
+            old_file.as_raw_fd(),
+            oldname,
+            new_file.as_raw_fd(),
+            newname,
+            flags,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e)
+                if flags & libc::RENAME_WHITEOUT != 0 && Self::rename_whiteout_unsupported(&e) =>
+            {
+                self.emulate_rename_whiteout(
+                    ctx,
+                    old_file.as_raw_fd(),
+                    oldname,
+                    new_file.as_raw_fd(),
+                    newname,
+                    flags,
+                )
+            }
+            Err(e) => Err(e),
         }
     }
 
