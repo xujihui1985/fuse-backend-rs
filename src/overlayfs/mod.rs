@@ -1438,6 +1438,16 @@ impl OverlayFs {
         //v.lookups.compare_exchange(old, new, Ordering::Acquire, Ordering::Relaxed);
 
         if lookups == 0 {
+            let linked_paths = v.link_paths.lock().unwrap().len();
+            if linked_paths > 0 {
+                trace!(
+                    "keep cached inode {} with {} live path(s) after forget",
+                    inode,
+                    linked_paths
+                );
+                return;
+            }
+
             debug!("inode is forgotten: {}, name {}", inode, v.name);
             let _ = self.remove_inode(inode, None);
             let parent = v.parent.lock().unwrap();
