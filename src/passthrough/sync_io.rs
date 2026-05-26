@@ -405,13 +405,30 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         inode: Inode,
         flags: libc::c_int,
     ) -> io::Result<Arc<HandleData>> {
-        let no_open = self.no_open.load(Ordering::Relaxed);
-        if !no_open {
-            self.handle_map.get(handle, inode)
-        } else {
-            let file = self.open_inode(inode, flags)?;
-            Ok(Arc::new(HandleData::new(inode, file, flags as u32)))
+        if let Ok(data) = self.handle_map.get(handle, inode) {
+            return Ok(data);
         }
+
+        if self.no_open.load(Ordering::Relaxed) {
+            if let Ok(data) = self.handle_map.get_by_inode(inode) {
+                return Ok(data);
+            }
+
+            let file = self.open_inode(inode, flags).map_err(|e| {
+                error!(
+                    "passthrough get_data open_inode failed: inode={}, handle={}, flags={}, error={}",
+                    inode, handle, flags, e
+                );
+                e
+            })?;
+            return Ok(Arc::new(HandleData::new(inode, file, flags as u32)));
+        }
+
+        error!(
+            "passthrough get_data handle miss: inode={}, handle={}, flags={}, no_open=false",
+            inode, handle, flags
+        );
+        Err(ebadf())
     }
 }
 
@@ -661,8 +678,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> io::Result<()> {
-        if self.no_open.load(Ordering::Relaxed) {
-            Err(enosys())
+        if self.no_open.load(Ordering::Relaxed) && self.handle_map.get(handle, inode).is_err() {
+            Ok(())
         } else {
             self.do_release(inode, handle)
         }
@@ -708,15 +725,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             }
         };
 
-        let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
-            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-            let data = HandleData::new(entry.inode, file, args.flags);
-
-            self.handle_map.insert(handle, data);
-            Some(handle)
-        } else {
-            None
-        };
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let data = HandleData::new(entry.inode, file, args.flags);
+        self.handle_map.insert(handle, data);
+        let ret_handle = Some(handle);
 
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
@@ -810,7 +822,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
-        let data = self.get_data(handle, inode, libc::O_RDWR)?;
+        let data = self.get_data(handle, inode, libc::O_RDWR).map_err(|e| {
+            error!(
+                "passthrough write get_data failed: inode={}, handle={}, error={}",
+                inode, handle, e
+            );
+            e
+        })?;
 
         // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
         // It's safe because the `data` variable's lifetime spans the whole function,
@@ -834,7 +852,18 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 None
             };
 
-        r.read_to(&mut *f, size as usize, offset)
+        r.read_to(&mut *f, size as usize, offset).map_err(|e| {
+            error!(
+                "passthrough write read_to failed: inode={}, handle={}, fd={}, size={}, offset={}, error={}",
+                inode,
+                handle,
+                f.as_raw_fd(),
+                size,
+                offset,
+                e
+            );
+            e
+        })
     }
 
     fn getattr(
@@ -1165,10 +1194,6 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        if self.no_open.load(Ordering::Relaxed) {
-            return Err(enosys());
-        }
-
         let data = self.handle_map.get(handle, inode)?;
 
         // Since this method is called whenever an fd is closed in the client, we can emulate that

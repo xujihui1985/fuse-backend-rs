@@ -38,7 +38,8 @@ impl FileSystem for OverlayFs {
             self.writeback.store(true, Ordering::Relaxed);
         }
 
-        if (!self.config.do_import || self.config.no_open)
+        if self.upper_layer.is_none()
+            && (!self.config.do_import || self.config.no_open)
             && capable.contains(FsOptions::ZERO_MESSAGE_OPEN)
         {
             opts |= FsOptions::ZERO_MESSAGE_OPEN;
@@ -292,7 +293,7 @@ impl FileSystem for OverlayFs {
             Some(handle) => {
                 let hd = self.next_handle.fetch_add(1, Ordering::Relaxed);
                 let (layer, in_upper_layer, inode) = node.first_layer_inode();
-                let handle_data = HandleData {
+                let handle_data = Arc::new(HandleData {
                     node: Arc::clone(&node),
                     real_handle: Some(RealHandle {
                         layer,
@@ -300,12 +301,13 @@ impl FileSystem for OverlayFs {
                         inode,
                         handle: AtomicU64::new(handle),
                     }),
-                };
+                });
 
-                self.handles
+                self.handles.lock().unwrap().insert(hd, handle_data.clone());
+                self.inode_open_handles
                     .lock()
                     .unwrap()
-                    .insert(hd, Arc::new(handle_data));
+                    .insert(handle_data.node.inode, handle_data);
 
                 let mut opts = OpenOptions::empty();
                 match self.config.cache_policy {
@@ -346,7 +348,8 @@ impl FileSystem for OverlayFs {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        if let Some(hd) = self.handles.lock().unwrap().get(&handle) {
+        let handle_data = self.handles.lock().unwrap().get(&handle).cloned();
+        if let Some(hd) = handle_data {
             let rh = if let Some(ref h) = hd.real_handle {
                 h
             } else {
@@ -354,7 +357,7 @@ impl FileSystem for OverlayFs {
             };
             let real_handle = rh.handle.load(Ordering::Relaxed);
             let real_inode = rh.inode;
-            rh.layer.release(
+            let release_result = rh.layer.release(
                 ctx,
                 real_inode,
                 flags,
@@ -362,10 +365,31 @@ impl FileSystem for OverlayFs {
                 flush,
                 flock_release,
                 lock_owner,
-            )?;
-        }
+            );
 
-        self.handles.lock().unwrap().remove(&handle);
+            self.handles.lock().unwrap().remove(&handle);
+            if self
+                .inode_open_handles
+                .lock()
+                .unwrap()
+                .get(&_inode)
+                .is_some_and(|inode_hd| Arc::ptr_eq(inode_hd, &hd))
+            {
+                self.inode_open_handles.lock().unwrap().remove(&_inode);
+            }
+
+            if let Err(e) = release_result {
+                let unlinked = hd.node.link_paths.lock().unwrap().is_empty();
+                if e.raw_os_error() == Some(libc::ENOENT) && unlinked {
+                    debug!(
+                        "ignore lower release ENOENT for unlinked open file: inode={}, handle={}, real_inode={}, real_handle={}",
+                        _inode, handle, real_inode, real_handle
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
+        }
 
         Ok(())
     }
@@ -487,22 +511,47 @@ impl FileSystem for OverlayFs {
             fuse_flags
         );
 
-        let data = self.get_data(ctx, Some(handle), inode, flags)?;
+        let data = self
+            .get_data(ctx, Some(handle), inode, flags)
+            .map_err(|e| {
+                error!(
+                    "overlay write get_data failed: inode={}, handle={}, flags={}, error={}",
+                    inode, handle, flags, e
+                );
+                e
+            })?;
 
         match data.real_handle {
-            None => Err(Error::from_raw_os_error(libc::ENOENT)),
-            Some(ref hd) => hd.layer.write(
-                ctx,
-                hd.inode,
-                hd.handle.load(Ordering::Relaxed),
-                r,
-                size,
-                offset,
-                lock_owner,
-                delayed_write,
-                flags,
-                fuse_flags,
-            ),
+            None => {
+                error!(
+                    "overlay write missing real handle: inode={}, handle={}",
+                    inode, handle
+                );
+                Err(Error::from_raw_os_error(libc::ENOENT))
+            }
+            Some(ref hd) => {
+                let real_handle = hd.handle.load(Ordering::Relaxed);
+                hd.layer
+                    .write(
+                        ctx,
+                        hd.inode,
+                        real_handle,
+                        r,
+                        size,
+                        offset,
+                        lock_owner,
+                        delayed_write,
+                        flags,
+                        fuse_flags,
+                    )
+                    .map_err(|e| {
+                        error!(
+                            "overlay write lower failed: inode={}, handle={}, real_inode={}, real_handle={}, flags={}, error={}",
+                            inode, handle, hd.inode, real_handle, flags, e
+                        );
+                        e
+                    })
+            }
         }
     }
 
@@ -710,17 +759,23 @@ impl FileSystem for OverlayFs {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        let node = self.lookup_node(ctx, inode, "")?;
+        let data = self
+            .get_data(ctx, Some(handle), inode, libc::O_RDONLY as u32)
+            .map_err(|e| {
+                error!(
+                    "overlay flush get_data failed: inode={}, handle={}, error={}",
+                    inode, handle, e
+                );
+                e
+            })?;
 
-        if node.whiteout.load(Ordering::Relaxed) {
-            return Err(Error::from_raw_os_error(libc::ENOENT));
+        match data.real_handle {
+            None => Err(Error::from_raw_os_error(libc::ENOENT)),
+            Some(ref rh) => {
+                rh.layer
+                    .flush(ctx, rh.inode, rh.handle.load(Ordering::Relaxed), lock_owner)
+            }
         }
-
-        let (layer, real_inode, real_handle) = self.find_real_info_from_handle(handle)?;
-
-        // FIXME: need to test if inode matches corresponding handle?
-
-        layer.flush(ctx, real_inode, real_handle, lock_owner)
     }
 
     fn fsync(&self, ctx: &Context, inode: Inode, datasync: bool, handle: Handle) -> Result<()> {

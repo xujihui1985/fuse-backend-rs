@@ -329,6 +329,17 @@ impl HandleMap {
         Err(ebadf())
     }
 
+    fn get_by_inode(&self, inode: Inode) -> io::Result<Arc<HandleData>> {
+        // Do not expect poisoned lock here, so safe to unwrap().
+        self.handles
+            .read()
+            .unwrap()
+            .values()
+            .find(|hd| hd.inode == inode)
+            .cloned()
+            .ok_or_else(ebadf)
+    }
+
     fn get(&self, handle: Handle, inode: Inode) -> io::Result<Arc<HandleData>> {
         // Do not expect poisoned lock here, so safe to unwrap().
         self.handles

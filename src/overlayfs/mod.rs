@@ -92,6 +92,7 @@ pub struct OverlayFs {
     inodes: RwLock<InodeStore>,
     // Open file handles.
     handles: Mutex<HashMap<u64, Arc<HandleData>>>,
+    inode_open_handles: Mutex<HashMap<Inode, Arc<HandleData>>>,
     next_handle: AtomicU64,
     writeback: AtomicBool,
     no_open: AtomicBool,
@@ -548,6 +549,17 @@ impl RealInode {
         let (entry, h, _, _) =
             self.layer
                 .create(ctx, self.inode, utils::to_cstring(name)?.as_c_str(), args)?;
+        let h = match h {
+            Some(handle) => Some(handle),
+            None => match self
+                .layer
+                .open(ctx, entry.inode, args.flags, args.fuse_flags)
+            {
+                Ok((handle, _, _)) => handle,
+                Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => None,
+                Err(e) => return Err(e),
+            },
+        };
 
         Ok((
             RealInode {
@@ -1159,6 +1171,7 @@ impl OverlayFs {
             upper_layer: upper,
             inodes: RwLock::new(InodeStore::new()),
             handles: Mutex::new(HashMap::new()),
+            inode_open_handles: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             writeback: AtomicBool::new(false),
             no_open: AtomicBool::new(false),
@@ -1851,23 +1864,28 @@ impl OverlayFs {
 
         let final_handle = match handle {
             Some(hd) => {
+                let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+                let handle_data = Arc::new(HandleData {
+                    node: new_ovi,
+                    real_handle: Some(RealHandle {
+                        layer: upper.clone(),
+                        in_upper_layer: true,
+                        inode: real_ino,
+                        handle: AtomicU64::new(hd),
+                    }),
+                });
+                self.handles
+                    .lock()
+                    .unwrap()
+                    .insert(handle, handle_data.clone());
+                self.inode_open_handles
+                    .lock()
+                    .unwrap()
+                    .insert(handle_data.node.inode, handle_data);
+
                 if self.no_open.load(Ordering::Relaxed) {
                     None
                 } else {
-                    let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-                    let handle_data = HandleData {
-                        node: new_ovi,
-                        real_handle: Some(RealHandle {
-                            layer: upper.clone(),
-                            in_upper_layer: true,
-                            inode: real_ino,
-                            handle: AtomicU64::new(hd),
-                        }),
-                    };
-                    self.handles
-                        .lock()
-                        .unwrap()
-                        .insert(handle, Arc::new(handle_data));
                     Some(handle)
                 }
             }
@@ -2737,16 +2755,19 @@ impl OverlayFs {
         inode: Inode,
         flags: u32,
     ) -> Result<Arc<HandleData>> {
-        let no_open = self.no_open.load(Ordering::Relaxed);
-        if !no_open {
-            if let Some(h) = handle {
-                if let Some(v) = self.handles.lock().unwrap().get(&h) {
-                    if v.node.inode == inode {
-                        return Ok(Arc::clone(v));
-                    }
+        if let Some(h) = handle {
+            if let Some(v) = self.handles.lock().unwrap().get(&h) {
+                if v.node.inode == inode {
+                    return Ok(Arc::clone(v));
                 }
             }
-        } else {
+        }
+
+        if let Some(v) = self.inode_open_handles.lock().unwrap().get(&inode) {
+            return Ok(Arc::clone(v));
+        }
+
+        if self.no_open.load(Ordering::Relaxed) {
             let readonly: bool = flags
                 & (libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR | libc::O_WRONLY)
                     as u32
