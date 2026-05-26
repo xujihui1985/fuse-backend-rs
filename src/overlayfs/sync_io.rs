@@ -522,11 +522,12 @@ impl FileSystem for OverlayFs {
             if let Some(h) = handle {
                 if let Some(hd) = self.handles.lock().unwrap().get(&h) {
                     if let Some(ref rh) = hd.real_handle {
-                        let (st, _d) = rh.layer.getattr(
+                        let (mut st, _d) = rh.layer.getattr(
                             ctx,
                             rh.inode,
                             Some(rh.handle.load(Ordering::Relaxed)),
                         )?;
+                        st.st_ino = inode;
                         return Ok((st, self.config.attr_timeout));
                     }
                 }
@@ -535,7 +536,8 @@ impl FileSystem for OverlayFs {
 
         let node = self.lookup_node(ctx, inode, "")?;
         let (layer, _, inode) = node.first_layer_inode();
-        let (st, _) = layer.getattr(ctx, inode, None)?;
+        let (mut st, _) = layer.getattr(ctx, inode, None)?;
+        st.st_ino = node.inode;
         Ok((st, self.config.attr_timeout))
     }
 

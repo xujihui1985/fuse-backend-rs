@@ -65,6 +65,10 @@ impl InodeStore {
         self.inodes.insert(inode, node);
     }
 
+    pub(crate) fn insert_path(&mut self, inode: Inode, path: String) {
+        self.path_mapping.insert(path, inode);
+    }
+
     pub(crate) fn get_inode(&self, inode: Inode) -> Option<Arc<OverlayInode>> {
         self.inodes.get(&inode).cloned()
     }
@@ -110,6 +114,10 @@ impl InodeStore {
         };
 
         removed
+    }
+
+    pub(crate) fn remove_path(&mut self, path: &String) {
+        self.path_mapping.remove(path);
     }
 
     // As a debug function, print all inode numbers in hash table.
