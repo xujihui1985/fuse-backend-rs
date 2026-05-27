@@ -1082,6 +1082,19 @@ mod tests {
         (fs, upper, lower)
     }
 
+    fn lookup_path(fs: &OverlayFs, ctx: &Context, path: &[&str]) -> Entry {
+        let mut entry = fs
+            .lookup(ctx, ROOT_ID, &CString::new(path[0]).unwrap())
+            .unwrap();
+        for name in &path[1..] {
+            entry = fs
+                .lookup(ctx, entry.inode, &CString::new(*name).unwrap())
+                .unwrap();
+        }
+
+        entry
+    }
+
     #[test]
     fn test_hardlink_reuses_overlay_inode() {
         let (fs, _upper, _lower) = prepare_overlayfs();
@@ -1210,6 +1223,86 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&entry.inode));
+    }
+
+    #[test]
+    fn test_mkdir_on_lower_only_dir_copies_it_up() {
+        let upper = TempDir::new().unwrap();
+        let lower = TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.as_path().join("usr/share/lintian/overrides")).unwrap();
+
+        let upper_layer =
+            Arc::new(new_passthrough_layer(upper.as_path().to_str().unwrap()).unwrap());
+        let lower_layer =
+            Arc::new(new_passthrough_layer(lower.as_path().to_str().unwrap()).unwrap());
+        let fs = OverlayFs::new(Some(upper_layer), vec![lower_layer], Config::default()).unwrap();
+        fs.import().unwrap();
+
+        let ctx = Context::default();
+        let lintian = lookup_path(&fs, &ctx, &["usr", "share", "lintian"]);
+        let name = CString::new("overrides").unwrap();
+
+        let entry = fs.mkdir(&ctx, lintian.inode, &name, 0o755, 0).unwrap();
+
+        assert!(upper.as_path().join("usr/share/lintian/overrides").is_dir());
+        assert_eq!(
+            entry.inode,
+            lookup_path(&fs, &ctx, &["usr", "share", "lintian", "overrides"]).inode
+        );
+    }
+
+    #[test]
+    fn test_setxattr_on_renamed_dir_uses_live_inode() {
+        let (fs, _upper, _lower) = prepare_overlayfs();
+        let ctx = Context::default();
+
+        let tmp = CString::new("tmp").unwrap();
+        let dst = CString::new("dst").unwrap();
+        let attr = CString::new("user.test").unwrap();
+
+        let entry = fs.mkdir(&ctx, ROOT_ID, &tmp, 0o755, 0).unwrap();
+        fs.rename(&ctx, ROOT_ID, &tmp, ROOT_ID, &dst, 0).unwrap();
+
+        fs.setxattr(&ctx, entry.inode, attr.as_c_str(), b"y", 0)
+            .unwrap();
+
+        let value = fs.getxattr(&ctx, entry.inode, attr.as_c_str(), 1).unwrap();
+        match value {
+            GetxattrReply::Value(v) => assert_eq!(v, b"y"),
+            _ => panic!("unexpected getxattr reply"),
+        }
+    }
+
+    #[test]
+    fn test_rename_into_renamed_dir_uses_same_inode() {
+        let (fs, _upper, _lower) = prepare_overlayfs();
+        let ctx = Context::default();
+
+        let tmp_parent = CString::new("tmp-parent").unwrap();
+        let final_parent = CString::new("final-parent").unwrap();
+        let tmp_child = CString::new("tmp-child").unwrap();
+        let final_child = CString::new("final-child").unwrap();
+
+        let parent_entry = fs.mkdir(&ctx, ROOT_ID, &tmp_parent, 0o755, 0).unwrap();
+        fs.rename(&ctx, ROOT_ID, &tmp_parent, ROOT_ID, &final_parent, 0)
+            .unwrap();
+
+        fs.mkdir(&ctx, ROOT_ID, &tmp_child, 0o755, 0).unwrap();
+        fs.rename(
+            &ctx,
+            ROOT_ID,
+            &tmp_child,
+            parent_entry.inode,
+            &final_child,
+            0,
+        )
+        .unwrap();
+
+        let child = fs
+            .lookup(&ctx, parent_entry.inode, final_child.as_c_str())
+            .unwrap();
+        let st = fs.getattr(&ctx, child.inode, None).unwrap().0;
+        assert!(utils::is_dir(st));
     }
 }
 
@@ -1357,6 +1450,11 @@ impl OverlayFs {
             Some(n) => Some(n),
             None => inode_store.get_deleted_inode(inode),
         }
+    }
+
+    fn get_live_inode(&self, inode: u64) -> Result<Arc<OverlayInode>> {
+        self.get_all_inode(inode)
+            .ok_or_else(|| Error::from_raw_os_error(libc::ENOENT))
     }
 
     // Return the inode only if it's permanently deleted from both self.inodes and self.deleted_inodes.
@@ -1631,7 +1729,17 @@ impl OverlayFs {
         for (index, (name, child)) in (0_u64..).zip(childrens.into_iter()) {
             if index >= offset {
                 // make struct DireEntry and Entry
-                let mut st = child.stat64(ctx)?;
+                let mut st = match child.stat64(ctx) {
+                    Ok(st) => st,
+                    Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                        debug!(
+                            "skip stale readdir entry '{}' under '{}': {}",
+                            name, ovl_inode.path, e
+                        );
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 st.st_ino = child.inode;
                 let dir_entry = DirEntry {
                     ino: child.inode,
@@ -1700,6 +1808,12 @@ impl OverlayFs {
         if let Some(n) = self.lookup_node_ignore_enoent(ctx, parent_node.inode, name)? {
             // Node with same name exists, let's check if it's whiteout.
             if !n.whiteout.load(Ordering::Relaxed) {
+                let st = n.stat64(ctx)?;
+                if utils::is_dir(st) && !n.in_upper_layer() {
+                    n.create_upper_dir(ctx, Some((mode, umask)))?;
+                    return Ok(());
+                }
+
                 return Err(Error::from_raw_os_error(libc::EEXIST));
             }
 
@@ -2207,8 +2321,7 @@ impl OverlayFs {
                 new_parent.remove_child(newname);
             }
 
-            old_node.lookups.fetch_sub(1, Ordering::Relaxed);
-            self.remove_inode(old_node.inode, Some(old_node.path.clone()));
+            self.remove_path_mapping(&old_path);
             old_parent.remove_child(oldname);
         } else {
             if let Some(target) = target_node {
@@ -2288,13 +2401,16 @@ impl OverlayFs {
         }
 
         if old_is_dir {
-            let moved_inode = self.alloc_inode(&moved_path)?;
+            let moved_inode = old_node.inode;
             let mut moved_node = OverlayInode::new_from_real_inode(
                 newname,
                 moved_inode,
                 moved_path,
                 moved_real_inode,
             );
+            moved_node
+                .lookups
+                .store(old_node.lookups.load(Ordering::Relaxed), Ordering::Relaxed);
             moved_node.parent = Mutex::new(Arc::downgrade(&new_parent));
             let moved_node = Arc::new(moved_node);
             self.insert_inode(moved_inode, moved_node.clone());
@@ -2795,12 +2911,9 @@ impl OverlayFs {
     }
 
     fn find_real_inode(&self, inode: Inode) -> Result<(Arc<BoxedLayer>, Inode)> {
-        if let Some(n) = self.get_active_inode(inode) {
-            let (first_layer, _, first_inode) = n.first_layer_inode();
-            return Ok((first_layer, first_inode));
-        }
-
-        Err(Error::from_raw_os_error(libc::ENOENT))
+        let n = self.get_live_inode(inode)?;
+        let (first_layer, _, first_inode) = n.first_layer_inode();
+        Ok((first_layer, first_inode))
     }
 
     fn get_data(

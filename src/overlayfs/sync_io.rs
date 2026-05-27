@@ -677,7 +677,7 @@ impl FileSystem for OverlayFs {
             }
         }
 
-        let mut node = self.lookup_node(ctx, inode, "")?;
+        let mut node = self.get_live_inode(inode)?;
 
         if !node.in_upper_layer() {
             node = self.copy_node_up(ctx, Arc::clone(&node))?
@@ -786,7 +786,7 @@ impl FileSystem for OverlayFs {
     fn readlink(&self, ctx: &Context, inode: Inode) -> Result<Vec<u8>> {
         trace!("READLINK: inode: {}\n", inode);
 
-        let node = self.lookup_node(ctx, inode, "")?;
+        let node = self.get_live_inode(inode)?;
 
         if node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
@@ -855,7 +855,7 @@ impl FileSystem for OverlayFs {
 
     fn access(&self, ctx: &Context, inode: Inode, mask: u32) -> Result<()> {
         trace!("ACCESS: inode: {}, mask: {}\n", inode, mask);
-        let node = self.lookup_node(ctx, inode, "")?;
+        let node = self.get_live_inode(inode)?;
 
         if node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
@@ -880,7 +880,7 @@ impl FileSystem for OverlayFs {
             value,
             flags
         );
-        let node = self.lookup_node(ctx, inode, "")?;
+        let node = self.get_live_inode(inode)?;
 
         if node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
@@ -911,7 +911,7 @@ impl FileSystem for OverlayFs {
             name.to_string_lossy(),
             size
         );
-        let node = self.lookup_node(ctx, inode, "")?;
+        let node = self.get_live_inode(inode)?;
 
         if node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
@@ -924,7 +924,7 @@ impl FileSystem for OverlayFs {
 
     fn listxattr(&self, ctx: &Context, inode: Inode, size: u32) -> Result<ListxattrReply> {
         trace!("LISTXATTR: inode: {}, size: {}\n", inode, size);
-        let node = self.lookup_node(ctx, inode, "")?;
+        let node = self.get_live_inode(inode)?;
 
         if node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
@@ -941,7 +941,7 @@ impl FileSystem for OverlayFs {
             inode,
             name.to_string_lossy()
         );
-        let node = self.lookup_node(ctx, inode, "")?;
+        let node = self.get_live_inode(inode)?;
 
         if node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
