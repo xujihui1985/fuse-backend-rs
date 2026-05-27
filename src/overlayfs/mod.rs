@@ -1338,6 +1338,32 @@ mod tests {
         let renamed = fs.lookup(&ctx, ROOT_ID, dst.as_c_str()).unwrap();
         assert_eq!(renamed.inode, src_entry.inode);
     }
+
+    #[test]
+    fn test_zero_handle_write_copies_up_lower_file() {
+        let upper = TempDir::new().unwrap();
+        let lower = TempDir::new().unwrap();
+        std::fs::write(lower.as_path().join("lower-file"), b"lower").unwrap();
+
+        let upper_layer =
+            Arc::new(new_passthrough_layer(upper.as_path().to_str().unwrap()).unwrap());
+        let lower_layer =
+            Arc::new(new_passthrough_layer(lower.as_path().to_str().unwrap()).unwrap());
+        let fs = OverlayFs::new(Some(upper_layer), vec![lower_layer], Config::default()).unwrap();
+        fs.import().unwrap();
+
+        let ctx = Context::default();
+        let name = CString::new("lower-file").unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, name.as_c_str()).unwrap();
+
+        let data = fs
+            .get_data(&ctx, Some(0), entry.inode, libc::O_WRONLY as u32)
+            .unwrap();
+        let rh = data.real_handle.as_ref().unwrap();
+
+        assert!(rh.in_upper_layer);
+        assert!(upper.as_path().join("lower-file").exists());
+    }
 }
 
 impl OverlayFs {
@@ -2983,6 +3009,19 @@ impl OverlayFs {
                 if node.whiteout.load(Ordering::Relaxed) {
                     return Err(Error::from_raw_os_error(libc::ENOENT));
                 }
+
+                let readonly: bool = flags
+                    & (libc::O_APPEND
+                        | libc::O_CREAT
+                        | libc::O_TRUNC
+                        | libc::O_RDWR
+                        | libc::O_WRONLY) as u32
+                    == 0;
+                let node = if readonly || node.link_paths.lock().unwrap().is_empty() {
+                    node
+                } else {
+                    self.copy_node_up(ctx, node)?
+                };
 
                 let (first_layer, first_in_upper_layer, first_inode) = node.first_layer_inode();
                 let (layer, real_handle, in_upper_layer, real_inode) =
