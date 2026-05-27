@@ -1304,6 +1304,40 @@ mod tests {
         let st = fs.getattr(&ctx, child.inode, None).unwrap().0;
         assert!(utils::is_dir(st));
     }
+
+    #[test]
+    fn test_rename_over_lower_target_survives_target_forget() {
+        let upper = TempDir::new().unwrap();
+        let lower = TempDir::new().unwrap();
+        std::fs::write(lower.as_path().join("dst"), b"lower-target").unwrap();
+
+        let upper_layer =
+            Arc::new(new_passthrough_layer(upper.as_path().to_str().unwrap()).unwrap());
+        let lower_layer =
+            Arc::new(new_passthrough_layer(lower.as_path().to_str().unwrap()).unwrap());
+        let fs = OverlayFs::new(Some(upper_layer), vec![lower_layer], Config::default()).unwrap();
+        fs.import().unwrap();
+
+        let ctx = Context::default();
+        let dst = CString::new("dst").unwrap();
+        let src = CString::new("src").unwrap();
+
+        let target_entry = fs.lookup(&ctx, ROOT_ID, dst.as_c_str()).unwrap();
+        let (src_entry, handle, _, _) = fs
+            .create(&ctx, ROOT_ID, src.as_c_str(), CreateIn::default())
+            .unwrap();
+        if let Some(handle) = handle {
+            fs.release(&ctx, src_entry.inode, 0, handle, false, false, None)
+                .unwrap();
+        }
+
+        fs.rename(&ctx, ROOT_ID, src.as_c_str(), ROOT_ID, dst.as_c_str(), 0)
+            .unwrap();
+        fs.forget(&ctx, target_entry.inode, 1);
+
+        let renamed = fs.lookup(&ctx, ROOT_ID, dst.as_c_str()).unwrap();
+        assert_eq!(renamed.inode, src_entry.inode);
+    }
 }
 
 impl OverlayFs {
@@ -1619,8 +1653,12 @@ impl OverlayFs {
             let parent = v.parent.lock().unwrap();
 
             if let Some(p) = parent.upgrade() {
-                // remove it from hashmap
-                p.remove_child(v.name.as_str());
+                // Only remove the parent's entry if it still points at this inode.
+                if p.child(v.name.as_str())
+                    .is_some_and(|child| Arc::ptr_eq(&child, &v))
+                {
+                    p.remove_child(v.name.as_str());
+                }
             }
         }
     }
