@@ -600,22 +600,39 @@ impl FileSystem for OverlayFs {
         );
 
         if !self.no_open.load(Ordering::Relaxed) {
-            if let Some(h) = handle {
-                if let Some(hd) = self.handles.lock().unwrap().get(&h) {
-                    if let Some(ref rh) = hd.real_handle {
-                        let (mut st, _d) = rh.layer.getattr(
-                            ctx,
-                            rh.inode,
-                            Some(rh.handle.load(Ordering::Relaxed)),
-                        )?;
-                        st.st_ino = inode;
-                        return Ok((st, self.config.attr_timeout));
+            let handle_data = handle.and_then(|h| {
+                self.handles.lock().unwrap().get(&h).cloned().or_else(|| {
+                    if h == 0 {
+                        self.inode_open_handles.lock().unwrap().get(&inode).cloned()
+                    } else {
+                        None
                     }
+                })
+            });
+            if let Some(hd) = handle_data {
+                if hd.node.inode != inode {
+                    debug!(
+                        "overlay getattr inode mismatch for live handle: handle={}, request_inode={}, handle_inode={}",
+                        handle.unwrap_or_default(), inode, hd.node.inode
+                    );
+                }
+                if let Some(ref rh) = hd.real_handle {
+                    let (mut st, _d) =
+                        rh.layer
+                            .getattr(ctx, rh.inode, Some(rh.handle.load(Ordering::Relaxed)))?;
+                    st.st_ino = inode;
+                    return Ok((st, self.config.attr_timeout));
                 }
             }
         }
 
-        let node = self.lookup_node(ctx, inode, "")?;
+        let node = self
+            .get_all_inode(inode)
+            .ok_or_else(|| Error::from_raw_os_error(libc::ENOENT))?;
+        if node.whiteout.load(Ordering::Relaxed) {
+            return Err(Error::from_raw_os_error(libc::ENOENT));
+        }
+
         let (layer, _, inode) = node.first_layer_inode();
         let (mut st, _) = layer.getattr(ctx, inode, None)?;
         st.st_ino = node.inode;
