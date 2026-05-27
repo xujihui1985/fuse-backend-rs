@@ -318,12 +318,17 @@ impl HandleMap {
         let mut handles = self.handles.write().unwrap();
 
         if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
-            if e.get().inode == inode {
-                // We don't need to close the file here because that will happen automatically when
-                // the last `Arc` is dropped.
-                e.remove();
-                return Ok(());
+            if e.get().inode != inode {
+                debug!(
+                    "passthrough release inode mismatch for live handle: handle={}, request_inode={}, handle_inode={}",
+                    handle, inode, e.get().inode
+                );
             }
+
+            // We don't need to close the file here because that will happen automatically when
+            // the last `Arc` is dropped.
+            e.remove();
+            return Ok(());
         }
 
         Err(ebadf())
@@ -346,8 +351,15 @@ impl HandleMap {
             .read()
             .unwrap()
             .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
+            .map(|hd| {
+                if hd.inode != inode {
+                    debug!(
+                        "passthrough get inode mismatch for live handle: handle={}, request_inode={}, handle_inode={}",
+                        handle, inode, hd.inode
+                    );
+                }
+                hd.clone()
+            })
             .ok_or_else(ebadf)
     }
 }

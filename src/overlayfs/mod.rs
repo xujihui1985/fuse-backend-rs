@@ -1156,6 +1156,61 @@ mod tests {
         assert_eq!(remaining_link.inode, new_entry.inode);
         assert_ne!(renamed.inode, remaining_link.inode);
     }
+
+    #[test]
+    fn test_zero_handle_get_data_finds_unlinked_inode() {
+        let (fs, _upper, _lower) = prepare_overlayfs();
+        let ctx = Context::default();
+
+        let name = CString::new("unlinked-open").unwrap();
+        let (entry, handle, _, _) = fs
+            .create(&ctx, ROOT_ID, &name, CreateIn::default())
+            .unwrap();
+
+        if let Some(handle) = handle {
+            fs.handles.lock().unwrap().remove(&handle);
+        }
+        fs.inode_open_handles.lock().unwrap().remove(&entry.inode);
+        fs.no_open.store(true, Ordering::Relaxed);
+
+        fs.unlink(&ctx, ROOT_ID, &name).unwrap();
+
+        let data = fs
+            .get_data(&ctx, Some(0), entry.inode, libc::O_WRONLY as u32)
+            .unwrap();
+        assert_eq!(data.node.inode, entry.inode);
+        assert_eq!(
+            data.real_handle
+                .as_ref()
+                .unwrap()
+                .handle
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn test_zero_handle_release_closes_inode_handle() {
+        let (fs, _upper, _lower) = prepare_overlayfs();
+        let ctx = Context::default();
+
+        let name = CString::new("release-zero-handle").unwrap();
+        let (entry, handle, _, _) = fs
+            .create(&ctx, ROOT_ID, &name, CreateIn::default())
+            .unwrap();
+        let handle = handle.unwrap();
+
+        fs.unlink(&ctx, ROOT_ID, &name).unwrap();
+        fs.release(&ctx, entry.inode, 0, 0, false, false, None)
+            .unwrap();
+
+        assert!(!fs.handles.lock().unwrap().contains_key(&handle));
+        assert!(!fs
+            .inode_open_handles
+            .lock()
+            .unwrap()
+            .contains_key(&entry.inode));
+    }
 }
 
 impl OverlayFs {
@@ -2757,14 +2812,54 @@ impl OverlayFs {
     ) -> Result<Arc<HandleData>> {
         if let Some(h) = handle {
             if let Some(v) = self.handles.lock().unwrap().get(&h) {
-                if v.node.inode == inode {
-                    return Ok(Arc::clone(v));
+                if v.node.inode != inode {
+                    debug!(
+                        "overlay get_data inode mismatch for live handle: handle={}, request_inode={}, handle_inode={}",
+                        h, inode, v.node.inode
+                    );
                 }
+
+                return Ok(Arc::clone(v));
             }
         }
 
         if let Some(v) = self.inode_open_handles.lock().unwrap().get(&inode) {
             return Ok(Arc::clone(v));
+        }
+
+        if handle == Some(0) && !self.no_open.load(Ordering::Relaxed) {
+            if let Some(node) = self.get_all_inode(inode) {
+                if node.whiteout.load(Ordering::Relaxed) {
+                    return Err(Error::from_raw_os_error(libc::ENOENT));
+                }
+
+                let (first_layer, first_in_upper_layer, first_inode) = node.first_layer_inode();
+                let (layer, real_handle, in_upper_layer, real_inode) =
+                    match node.open(ctx, flags, 0) {
+                        Ok((layer, Some(real_handle), _)) => {
+                            (layer, real_handle, first_in_upper_layer, first_inode)
+                        }
+                        Ok((_, None, _)) => (first_layer, 0, first_in_upper_layer, first_inode),
+                        Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                            (first_layer, 0, first_in_upper_layer, first_inode)
+                        }
+                        Err(e) => return Err(e),
+                    };
+                let handle_data = Arc::new(HandleData {
+                    node: Arc::clone(&node),
+                    real_handle: Some(RealHandle {
+                        layer,
+                        in_upper_layer,
+                        inode: real_inode,
+                        handle: AtomicU64::new(real_handle),
+                    }),
+                });
+                self.inode_open_handles
+                    .lock()
+                    .unwrap()
+                    .insert(handle_data.node.inode, handle_data.clone());
+                return Ok(handle_data);
+            }
         }
 
         if self.no_open.load(Ordering::Relaxed) {
@@ -2773,8 +2868,9 @@ impl OverlayFs {
                     as u32
                 == 0;
 
-            // lookup node
-            let node = self.lookup_node(ctx, inode, "")?;
+            let node = self
+                .get_all_inode(inode)
+                .ok_or_else(|| Error::from_raw_os_error(libc::ENOENT))?;
 
             // whiteout node
             if node.whiteout.load(Ordering::Relaxed) {
@@ -2788,7 +2884,9 @@ impl OverlayFs {
                     .cloned()
                     .ok_or_else(|| Error::from_raw_os_error(libc::EROFS))?;
                 // copy up to upper layer
-                self.copy_node_up(ctx, Arc::clone(&node))?;
+                if !node.link_paths.lock().unwrap().is_empty() {
+                    self.copy_node_up(ctx, Arc::clone(&node))?;
+                }
             }
 
             let (layer, in_upper_layer, inode) = node.first_layer_inode();

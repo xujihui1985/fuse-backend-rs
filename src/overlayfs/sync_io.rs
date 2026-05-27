@@ -348,8 +348,30 @@ impl FileSystem for OverlayFs {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        let handle_data = self.handles.lock().unwrap().get(&handle).cloned();
+        let handle_data = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(&handle)
+            .cloned()
+            .or_else(|| {
+                if handle == 0 {
+                    self.inode_open_handles
+                        .lock()
+                        .unwrap()
+                        .get(&_inode)
+                        .cloned()
+                } else {
+                    None
+                }
+            });
         if let Some(hd) = handle_data {
+            if hd.node.inode != _inode {
+                debug!(
+                    "overlay release inode mismatch for live handle: handle={}, request_inode={}, handle_inode={}",
+                    handle, _inode, hd.node.inode
+                );
+            }
             let rh = if let Some(ref h) = hd.real_handle {
                 h
             } else {
@@ -367,15 +389,21 @@ impl FileSystem for OverlayFs {
                 lock_owner,
             );
 
-            self.handles.lock().unwrap().remove(&handle);
+            self.handles
+                .lock()
+                .unwrap()
+                .retain(|_, data| !Arc::ptr_eq(data, &hd));
             if self
                 .inode_open_handles
                 .lock()
                 .unwrap()
-                .get(&_inode)
+                .get(&hd.node.inode)
                 .is_some_and(|inode_hd| Arc::ptr_eq(inode_hd, &hd))
             {
-                self.inode_open_handles.lock().unwrap().remove(&_inode);
+                self.inode_open_handles
+                    .lock()
+                    .unwrap()
+                    .remove(&hd.node.inode);
             }
 
             if let Err(e) = release_result {
@@ -772,8 +800,11 @@ impl FileSystem for OverlayFs {
         match data.real_handle {
             None => Err(Error::from_raw_os_error(libc::ENOENT)),
             Some(ref rh) => {
-                rh.layer
-                    .flush(ctx, rh.inode, rh.handle.load(Ordering::Relaxed), lock_owner)
+                let real_handle = rh.handle.load(Ordering::Relaxed);
+                match rh.layer.flush(ctx, rh.inode, real_handle, lock_owner) {
+                    Err(e) if real_handle == 0 && e.raw_os_error() == Some(libc::ENOSYS) => Ok(()),
+                    result => result,
+                }
             }
         }
     }

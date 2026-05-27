@@ -34,9 +34,10 @@ impl FileSystem for Vfs {
             } else {
                 n_opts.out_opts.remove(FsOptions::ZERO_MESSAGE_OPENDIR);
             }
-            if n_opts.no_writeback {
-                n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
-            }
+            n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
+            // if n_opts.no_writeback {
+            //     n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
+            // }
             if !n_opts.killpriv_v2 {
                 n_opts.out_opts.remove(FsOptions::HANDLE_KILLPRIV_V2);
             }
