@@ -379,15 +379,19 @@ impl FileSystem for OverlayFs {
             };
             let real_handle = rh.handle.load(Ordering::Relaxed);
             let real_inode = rh.inode;
-            let release_result = rh.layer.release(
-                ctx,
-                real_inode,
-                flags,
-                real_handle,
-                flush,
-                flock_release,
-                lock_owner,
-            );
+            let release_result = if real_handle == 0 {
+                Ok(())
+            } else {
+                rh.layer.release(
+                    ctx,
+                    real_inode,
+                    flags,
+                    real_handle,
+                    flush,
+                    flock_release,
+                    lock_owner,
+                )
+            };
 
             self.handles
                 .lock()
@@ -801,9 +805,10 @@ impl FileSystem for OverlayFs {
             None => Err(Error::from_raw_os_error(libc::ENOENT)),
             Some(ref rh) => {
                 let real_handle = rh.handle.load(Ordering::Relaxed);
-                match rh.layer.flush(ctx, rh.inode, real_handle, lock_owner) {
-                    Err(e) if real_handle == 0 && e.raw_os_error() == Some(libc::ENOSYS) => Ok(()),
-                    result => result,
+                if real_handle == 0 {
+                    Ok(())
+                } else {
+                    rh.layer.flush(ctx, rh.inode, real_handle, lock_owner)
                 }
             }
         }
