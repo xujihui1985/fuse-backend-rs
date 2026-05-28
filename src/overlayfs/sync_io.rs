@@ -254,12 +254,13 @@ impl FileSystem for OverlayFs {
             return Err(Error::from_raw_os_error(libc::ENOSYS));
         }
 
-        let readonly: bool = flags
+        let backend_flags = Self::backend_open_flags(flags);
+        let readonly: bool = backend_flags
             & (libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR | libc::O_WRONLY)
                 as u32
             == 0;
         // toggle flags
-        let mut flags: i32 = flags as i32;
+        let mut flags: i32 = backend_flags as i32;
 
         flags |= libc::O_NOFOLLOW;
 

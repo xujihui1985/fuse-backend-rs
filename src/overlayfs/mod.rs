@@ -1364,9 +1364,39 @@ mod tests {
         assert!(rh.in_upper_layer);
         assert!(upper.as_path().join("lower-file").exists());
     }
+
+    #[test]
+    fn test_backend_open_flags_drop_fuse_exec_bits() {
+        let exec_flags = 0x0404_8020;
+        let backend_flags = OverlayFs::backend_open_flags(exec_flags);
+
+        assert_eq!(backend_flags & 0x20, 0);
+        assert_eq!(backend_flags & 0x0400_0000, 0);
+    }
 }
 
 impl OverlayFs {
+    fn backend_open_flags(flags: u32) -> u32 {
+        let valid = libc::O_ACCMODE
+            | libc::O_APPEND
+            | libc::O_CREAT
+            | libc::O_EXCL
+            | libc::O_NOCTTY
+            | libc::O_TRUNC
+            | libc::O_NONBLOCK
+            | libc::O_DSYNC
+            | libc::O_DIRECT
+            | libc::O_LARGEFILE
+            | libc::O_DIRECTORY
+            | libc::O_NOFOLLOW
+            | libc::O_NOATIME
+            | libc::O_CLOEXEC
+            | libc::O_PATH
+            | libc::O_TMPFILE;
+
+        flags & valid as u32
+    }
+
     pub fn new(
         upper: Option<Arc<BoxedLayer>>,
         lowers: Vec<Arc<BoxedLayer>>,
@@ -3010,7 +3040,8 @@ impl OverlayFs {
                     return Err(Error::from_raw_os_error(libc::ENOENT));
                 }
 
-                let readonly: bool = flags
+                let backend_flags = Self::backend_open_flags(flags);
+                let readonly: bool = backend_flags
                     & (libc::O_APPEND
                         | libc::O_CREAT
                         | libc::O_TRUNC
@@ -3025,7 +3056,7 @@ impl OverlayFs {
 
                 let (first_layer, first_in_upper_layer, first_inode) = node.first_layer_inode();
                 let (layer, real_handle, in_upper_layer, real_inode) =
-                    match node.open(ctx, flags, 0) {
+                    match node.open(ctx, backend_flags, 0) {
                         Ok((layer, Some(real_handle), _)) => {
                             (layer, real_handle, first_in_upper_layer, first_inode)
                         }
@@ -3053,7 +3084,8 @@ impl OverlayFs {
         }
 
         if self.no_open.load(Ordering::Relaxed) {
-            let readonly: bool = flags
+            let backend_flags = Self::backend_open_flags(flags);
+            let readonly: bool = backend_flags
                 & (libc::O_APPEND | libc::O_CREAT | libc::O_TRUNC | libc::O_RDWR | libc::O_WRONLY)
                     as u32
                 == 0;
