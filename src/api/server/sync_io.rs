@@ -3,6 +3,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-BSD-3-Clause file.
 
+use std::ffi::CStr;
 use std::io::{self, IoSlice, Read, Write};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -106,6 +107,30 @@ impl<F: FileSystem + Sync> Server<F> {
             .map_err(Error::FailedToWrite)?;
         buffer_writer.commit(None).map_err(Error::InvalidMessage)?;
         Ok(())
+    }
+
+    fn invalidate_entry_cache<S: BitmapSlice>(
+        &self,
+        ctx: &SrvContext<'_, F, S>,
+        parent: u64,
+        name: &CStr,
+    ) {
+        #[cfg(feature = "fusedev")]
+        {
+            if let Writer::FuseDev(w) = &ctx.w {
+                if let Err(e) = w.notify_inval_entry(parent, name) {
+                    trace!(
+                        "fuse: notify inval entry failed: parent {}, name {:?}, error {:?}",
+                        parent,
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(feature = "fusedev"))]
+        let _ = (ctx, parent, name);
     }
 
     /// Main entrance to handle requests from the transport layer.
@@ -364,8 +389,15 @@ impl<F: FileSystem + Sync> Server<F> {
             e
         })?;
 
+        let parent = ctx.in_header.nodeid;
         match self.fs.unlink(ctx.context(), ctx.nodeid(), name) {
-            Ok(()) => ctx.reply_ok(None::<u8>, None),
+            Ok(()) => {
+                let res = ctx.reply_ok(None::<u8>, None);
+                if res.is_ok() {
+                    self.invalidate_entry_cache(&ctx, parent, name);
+                }
+                res
+            }
             Err(e) => ctx.reply_error(e),
         }
     }
@@ -378,8 +410,22 @@ impl<F: FileSystem + Sync> Server<F> {
             e
         })?;
 
+        let parent = ctx.in_header.nodeid;
         match self.fs.rmdir(ctx.context(), ctx.nodeid(), name) {
-            Ok(()) => ctx.reply_ok(None::<u8>, None),
+            Ok(()) => {
+                let res = ctx.reply_ok(None::<u8>, None);
+                if res.is_ok() {
+                    self.invalidate_entry_cache(&ctx, parent, name);
+                }
+                res
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => {
+                let res = ctx.reply_error(e);
+                if res.is_ok() {
+                    self.invalidate_entry_cache(&ctx, parent, name);
+                }
+                res
+            }
             Err(e) => ctx.reply_error(e),
         }
     }
@@ -394,6 +440,7 @@ impl<F: FileSystem + Sync> Server<F> {
         let buf = ServerUtil::get_message_body(&mut ctx.r, &ctx.in_header, msg_size)?;
         let (oldname, newname) = ServerUtil::extract_two_cstrs(&buf)?;
 
+        let olddir = ctx.in_header.nodeid;
         match self.fs.rename(
             ctx.context(),
             ctx.nodeid(),
@@ -402,7 +449,14 @@ impl<F: FileSystem + Sync> Server<F> {
             newname,
             flags,
         ) {
-            Ok(()) => ctx.reply_ok(None::<u8>, None),
+            Ok(()) => {
+                let res = ctx.reply_ok(None::<u8>, None);
+                if res.is_ok() {
+                    self.invalidate_entry_cache(&ctx, olddir, oldname);
+                    self.invalidate_entry_cache(&ctx, newdir, newname);
+                }
+                res
+            }
             Err(e) => ctx.reply_error(e),
         }
     }
@@ -432,11 +486,18 @@ impl<F: FileSystem + Sync> Server<F> {
             e
         })?;
 
+        let parent = ctx.in_header.nodeid;
         match self
             .fs
             .link(ctx.context(), oldnodeid.into(), ctx.nodeid(), name)
         {
-            Ok(entry) => ctx.reply_ok(Some(EntryOut::from(entry)), None),
+            Ok(entry) => {
+                let res = ctx.reply_ok(Some(EntryOut::from(entry)), None);
+                if res.is_ok() {
+                    self.invalidate_entry_cache(&ctx, parent, name);
+                }
+                res
+            }
             Err(e) => ctx.reply_error(e),
         }
     }

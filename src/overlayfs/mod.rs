@@ -7,7 +7,6 @@ mod inode_store;
 pub mod sync_io;
 mod utils;
 
-use core::panic;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -38,6 +37,7 @@ pub const PARENT_DIR: &str = "..";
 pub const MAXBUFSIZE: usize = 1 << 20;
 const NYDUS_WHITEOUT_XATTR: &str = "user.nydus.overlay.whiteout";
 const NYDUS_WHITEOUT_XATTR_VALUE: &[u8] = b"y";
+const OVERLAY_ORIGIN_XATTR: &str = "trusted.overlay.origin";
 
 //type BoxedFileSystem = Box<dyn FileSystem<Inode = Inode, Handle = Handle> + Send + Sync>;
 pub type BoxedLayer = Box<dyn Layer<Inode = Inode, Handle = Handle> + Send + Sync>;
@@ -1071,6 +1071,35 @@ fn entry_type_from_mode(mode: libc::mode_t) -> u8 {
         libc::S_IFSOCK => libc::DT_SOCK,
         _ => libc::DT_UNKNOWN,
     }
+}
+
+fn is_overlay_origin_xattr(name: &CStr) -> bool {
+    name.to_bytes() == OVERLAY_ORIGIN_XATTR.as_bytes()
+}
+
+fn filter_overlay_origin_xattr_names(names: &[u8]) -> Vec<u8> {
+    let mut filtered = Vec::with_capacity(names.len());
+
+    for name in names.split(|b| *b == 0) {
+        if name.is_empty() || name == OVERLAY_ORIGIN_XATTR.as_bytes() {
+            continue;
+        }
+
+        filtered.extend_from_slice(name);
+        filtered.push(0);
+    }
+
+    filtered
+}
+
+fn is_kernel_overlay_work_temp_rename(parent_path: &str, name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix('#') else {
+        return false;
+    };
+
+    !suffix.is_empty()
+        && suffix.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+        && (parent_path == "/work" || parent_path.starts_with("/work/"))
 }
 
 #[cfg(test)]
@@ -2517,6 +2546,7 @@ impl OverlayFs {
             opaque: moved_opaque,
             stat: Some(moved_entry.attr),
         };
+        let mut moved_real_inode = Some(moved_real_inode);
 
         let old_path = format!("{}/{}", old_parent.path, oldname);
         let moved_path = format!("{}/{}", new_parent.path, newname);
@@ -2524,6 +2554,12 @@ impl OverlayFs {
             .as_ref()
             .map(|target| target.inode == old_node.inode)
             .unwrap_or(false);
+        let preserve_target_inode = !old_is_dir
+            && is_kernel_overlay_work_temp_rename(&old_parent.path, oldname)
+            && target_node
+                .as_ref()
+                .map(|target| target.inode != old_node.inode)
+                .unwrap_or(false);
 
         if old_is_dir {
             if let Some(target) = target_node {
@@ -2537,18 +2573,38 @@ impl OverlayFs {
         } else {
             if let Some(target) = target_node {
                 if target.inode != old_node.inode {
-                    target.lookups.fetch_sub(1, Ordering::Relaxed);
-                    if target.remove_link_path(&moved_path) == 0 {
-                        self.remove_inode(target.inode, Some(moved_path.clone()));
+                    if preserve_target_inode {
+                        trace!(
+                            "preserve target inode {} for kernel overlay work rename {} -> {}",
+                            target.inode,
+                            old_path,
+                            moved_path
+                        );
+                        let moved_real_inode = moved_real_inode.take().ok_or_else(|| {
+                            Error::other("BUG: moved real inode already consumed")
+                        })?;
+                        target.add_upper_inode(moved_real_inode, true);
                     } else {
-                        self.remove_path_mapping(&moved_path);
+                        target.lookups.fetch_sub(1, Ordering::Relaxed);
+                        if target.remove_link_path(&moved_path) == 0 {
+                            self.remove_inode(target.inode, Some(moved_path.clone()));
+                        } else {
+                            self.remove_path_mapping(&moved_path);
+                        }
+                        new_parent.remove_child(newname);
                     }
-                    new_parent.remove_child(newname);
                 }
             }
 
             old_parent.remove_child(oldname);
             if target_reused_inode {
+                old_node.lookups.fetch_sub(1, Ordering::Relaxed);
+                if old_node.remove_link_path(&old_path) == 0 {
+                    self.remove_inode(old_node.inode, Some(old_path.clone()));
+                } else {
+                    self.remove_path_mapping(&old_path);
+                }
+            } else if preserve_target_inode {
                 old_node.lookups.fetch_sub(1, Ordering::Relaxed);
                 if old_node.remove_link_path(&old_path) == 0 {
                     self.remove_inode(old_node.inode, Some(old_path.clone()));
@@ -2613,6 +2669,9 @@ impl OverlayFs {
 
         if old_is_dir {
             let moved_inode = old_node.inode;
+            let moved_real_inode = moved_real_inode
+                .take()
+                .ok_or_else(|| Error::other("BUG: moved real inode already consumed"))?;
             let mut moved_node = OverlayInode::new_from_real_inode(
                 newname,
                 moved_inode,
@@ -2626,7 +2685,7 @@ impl OverlayFs {
             let moved_node = Arc::new(moved_node);
             self.insert_inode(moved_inode, moved_node.clone());
             new_parent.insert_child(newname, moved_node);
-        } else if !target_reused_inode {
+        } else if !target_reused_inode && !preserve_target_inode {
             old_node.add_link_path(moved_path.clone());
             self.insert_path_mapping(old_node.inode, moved_path);
             new_parent.insert_child(newname, old_node);

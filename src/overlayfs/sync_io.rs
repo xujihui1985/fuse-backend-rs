@@ -881,6 +881,11 @@ impl FileSystem for OverlayFs {
             value,
             flags
         );
+
+        if is_overlay_origin_xattr(name) {
+            return Ok(());
+        }
+
         let node = self.get_live_inode(inode)?;
 
         if node.whiteout.load(Ordering::Relaxed) {
@@ -912,6 +917,11 @@ impl FileSystem for OverlayFs {
             name.to_string_lossy(),
             size
         );
+
+        if is_overlay_origin_xattr(name) {
+            return Err(Error::from_raw_os_error(libc::ENODATA));
+        }
+
         let node = self.get_live_inode(inode)?;
 
         if node.whiteout.load(Ordering::Relaxed) {
@@ -933,7 +943,18 @@ impl FileSystem for OverlayFs {
 
         let (layer, real_inode) = self.find_real_inode(inode)?;
 
-        layer.listxattr(ctx, real_inode, size)
+        match layer.listxattr(ctx, real_inode, size)? {
+            ListxattrReply::Names(names) => Ok(ListxattrReply::Names(
+                filter_overlay_origin_xattr_names(&names),
+            )),
+            ListxattrReply::Count(0) => Ok(ListxattrReply::Count(0)),
+            ListxattrReply::Count(count) => match layer.listxattr(ctx, real_inode, count)? {
+                ListxattrReply::Names(names) => Ok(ListxattrReply::Count(
+                    filter_overlay_origin_xattr_names(&names).len() as u32,
+                )),
+                ListxattrReply::Count(count) => Ok(ListxattrReply::Count(count)),
+            },
+        }
     }
 
     fn removexattr(&self, ctx: &Context, inode: Inode, name: &CStr) -> Result<()> {
@@ -946,6 +967,15 @@ impl FileSystem for OverlayFs {
 
         if node.whiteout.load(Ordering::Relaxed) {
             return Err(Error::from_raw_os_error(libc::ENOENT));
+        }
+
+        if is_overlay_origin_xattr(name) {
+            let (layer, real_inode) = self.find_real_inode(inode)?;
+            return match layer.removexattr(ctx, real_inode, name) {
+                Ok(()) => Ok(()),
+                Err(e) if e.raw_os_error() == Some(libc::ENODATA) => Ok(()),
+                Err(e) => Err(e),
+            };
         }
 
         if !node.in_upper_layer() {
