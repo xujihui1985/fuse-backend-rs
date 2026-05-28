@@ -66,6 +66,8 @@ pub(crate) struct OverlayInode {
     pub real_inodes: Mutex<Vec<RealInode>>,
     // Inode number.
     pub inode: u64,
+    // Generation paired with `inode` in FUSE Entry replies.
+    pub generation: AtomicU64,
     pub path: String,
     pub name: String,
     pub lookups: AtomicU64,
@@ -162,7 +164,7 @@ impl RealInode {
             Ok(v1) => Ok(Some(v1)),
             Err(e) => match e.raw_os_error() {
                 Some(raw_error) => {
-                    if raw_error != libc::ENOENT || raw_error != libc::ENAMETOOLONG {
+                    if raw_error == libc::ENOENT || raw_error == libc::ENAMETOOLONG {
                         return Ok(None);
                     }
                     Err(e)
@@ -784,10 +786,30 @@ impl OverlayInode {
         ctx: &Context,
         flags: u32,
         fuse_flags: u32,
-    ) -> Result<(Arc<BoxedLayer>, Option<Handle>, OpenOptions)> {
-        let (layer, _, inode) = self.first_layer_inode();
-        let (h, o, _) = layer.as_ref().open(ctx, inode, flags, fuse_flags)?;
-        Ok((layer, h, o))
+    ) -> Result<(Arc<BoxedLayer>, bool, u64, Option<Handle>, OpenOptions)> {
+        let mut last_stale_error = None;
+        let real_inodes = self
+            .real_inodes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|ri| (ri.layer.clone(), ri.in_upper_layer, ri.inode))
+            .collect::<Vec<_>>();
+
+        for (layer, in_upper_layer, inode) in real_inodes {
+            match layer.as_ref().open(ctx, inode, flags, fuse_flags) {
+                Ok((handle, opts, _)) => return Ok((layer, in_upper_layer, inode, handle, opts)),
+                Err(e)
+                    if e.raw_os_error() == Some(libc::ENOENT)
+                        || e.raw_os_error() == Some(libc::ENAMETOOLONG) =>
+                {
+                    last_stale_error = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_stale_error.unwrap_or_else(|| Error::from_raw_os_error(libc::ENOENT)))
     }
 
     // Self is directory, fill all childrens.
@@ -1171,6 +1193,72 @@ mod tests {
     }
 
     #[test]
+    fn test_dpkg_backup_hardlink_survives_rename_over_original() {
+        let upper = TempDir::new().unwrap();
+        let lower = TempDir::new().unwrap();
+        std::fs::create_dir_all(lower.as_path().join("usr/bin")).unwrap();
+        std::fs::write(lower.as_path().join("usr/bin/dpkg"), b"old").unwrap();
+
+        let upper_layer =
+            Arc::new(new_passthrough_layer(upper.as_path().to_str().unwrap()).unwrap());
+        let lower_layer =
+            Arc::new(new_passthrough_layer(lower.as_path().to_str().unwrap()).unwrap());
+        let fs = OverlayFs::new(Some(upper_layer), vec![lower_layer], Config::default()).unwrap();
+        fs.import().unwrap();
+
+        let ctx = Context::default();
+        let usr_bin = lookup_path(&fs, &ctx, &["usr", "bin"]);
+        let dpkg = CString::new("dpkg").unwrap();
+        let dpkg_new = CString::new("dpkg.dpkg-new").unwrap();
+        let dpkg_tmp = CString::new("dpkg.dpkg-tmp").unwrap();
+
+        let old_entry = fs.lookup(&ctx, usr_bin.inode, dpkg.as_c_str()).unwrap();
+        let (new_entry, handle, _, _) = fs
+            .create(
+                &ctx,
+                usr_bin.inode,
+                dpkg_new.as_c_str(),
+                CreateIn::default(),
+            )
+            .unwrap();
+        if let Some(handle) = handle {
+            fs.release(&ctx, new_entry.inode, 0, handle, false, false, None)
+                .unwrap();
+        }
+
+        let backup_entry = fs
+            .link(&ctx, old_entry.inode, usr_bin.inode, dpkg_tmp.as_c_str())
+            .unwrap();
+        fs.rename(
+            &ctx,
+            usr_bin.inode,
+            dpkg_new.as_c_str(),
+            usr_bin.inode,
+            dpkg.as_c_str(),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs.rmdir(&ctx, usr_bin.inode, dpkg_tmp.as_c_str())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOTDIR)
+        );
+        let cleanup_entry = fs.lookup(&ctx, usr_bin.inode, dpkg_tmp.as_c_str()).unwrap();
+        assert_eq!(cleanup_entry.inode, backup_entry.inode);
+        let st = fs.getattr(&ctx, cleanup_entry.inode, None).unwrap().0;
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFREG);
+        fs.unlink(&ctx, usr_bin.inode, dpkg_tmp.as_c_str()).unwrap();
+        assert_eq!(
+            fs.lookup(&ctx, usr_bin.inode, dpkg_tmp.as_c_str())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOENT)
+        );
+    }
+
+    #[test]
     fn test_zero_handle_get_data_finds_unlinked_inode() {
         let (fs, _upper, _lower) = prepare_overlayfs();
         let ctx = Context::default();
@@ -1363,6 +1451,35 @@ mod tests {
 
         assert!(rh.in_upper_layer);
         assert!(upper.as_path().join("lower-file").exists());
+    }
+
+    #[test]
+    fn test_open_skips_stale_upper_inode() {
+        let upper = TempDir::new().unwrap();
+        let lower = TempDir::new().unwrap();
+        std::fs::write(upper.as_path().join("shared-file"), b"upper").unwrap();
+        std::fs::write(lower.as_path().join("shared-file"), b"lower").unwrap();
+
+        let upper_layer =
+            Arc::new(new_passthrough_layer(upper.as_path().to_str().unwrap()).unwrap());
+        let lower_layer =
+            Arc::new(new_passthrough_layer(lower.as_path().to_str().unwrap()).unwrap());
+        let fs = OverlayFs::new(Some(upper_layer), vec![lower_layer], Config::default()).unwrap();
+        fs.import().unwrap();
+
+        std::fs::remove_file(upper.as_path().join("shared-file")).unwrap();
+
+        let ctx = Context::default();
+        let name = CString::new("shared-file").unwrap();
+        let entry = fs.lookup(&ctx, ROOT_ID, name.as_c_str()).unwrap();
+
+        let (handle, _, _) = fs
+            .open(&ctx, entry.inode, libc::O_RDONLY as u32, 0)
+            .unwrap();
+        let handle = handle.unwrap();
+        let handle_data = fs.handles.lock().unwrap().get(&handle).cloned().unwrap();
+
+        assert!(!handle_data.real_handle.as_ref().unwrap().in_upper_layer);
     }
 
     #[test]
@@ -1738,7 +1855,7 @@ impl OverlayFs {
         trace!("lookup count: {}", tmp + 1);
         Ok(Entry {
             inode: node.inode,
-            generation: 0,
+            generation: node.generation.load(Ordering::Relaxed),
             attr: st,
             attr_flags: 0,
             attr_timeout: self.config.attr_timeout,
@@ -1846,7 +1963,7 @@ impl OverlayFs {
                     child.lookups.fetch_add(1, Ordering::Relaxed);
                     Some(Entry {
                         inode: child.inode,
-                        generation: 0,
+                        generation: child.generation.load(Ordering::Relaxed),
                         attr: st,
                         attr_flags: 0,
                         attr_timeout: self.config.attr_timeout,
@@ -3054,14 +3171,17 @@ impl OverlayFs {
                     self.copy_node_up(ctx, node)?
                 };
 
-                let (first_layer, first_in_upper_layer, first_inode) = node.first_layer_inode();
                 let (layer, real_handle, in_upper_layer, real_inode) =
                     match node.open(ctx, backend_flags, 0) {
-                        Ok((layer, Some(real_handle), _)) => {
-                            (layer, real_handle, first_in_upper_layer, first_inode)
+                        Ok((layer, in_upper_layer, real_inode, Some(real_handle), _)) => {
+                            (layer, real_handle, in_upper_layer, real_inode)
                         }
-                        Ok((_, None, _)) => (first_layer, 0, first_in_upper_layer, first_inode),
+                        Ok((layer, in_upper_layer, real_inode, None, _)) => {
+                            (layer, 0, in_upper_layer, real_inode)
+                        }
                         Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                            let (first_layer, first_in_upper_layer, first_inode) =
+                                node.first_layer_inode();
                             (first_layer, 0, first_in_upper_layer, first_inode)
                         }
                         Err(e) => return Err(e),

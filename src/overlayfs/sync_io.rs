@@ -287,40 +287,40 @@ impl FileSystem for OverlayFs {
             self.copy_node_up(ctx, Arc::clone(&node))?;
         }
 
-        // assign a handle in overlayfs and open it
-        let (_l, h, _) = node.open(ctx, flags as u32, fuse_flags)?;
-        match h {
-            None => Err(Error::from_raw_os_error(libc::ENOENT)),
-            Some(handle) => {
-                let hd = self.next_handle.fetch_add(1, Ordering::Relaxed);
-                let (layer, in_upper_layer, inode) = node.first_layer_inode();
-                let handle_data = Arc::new(HandleData {
-                    node: Arc::clone(&node),
-                    real_handle: Some(RealHandle {
-                        layer,
-                        in_upper_layer,
-                        inode,
-                        handle: AtomicU64::new(handle),
-                    }),
-                });
+        // Assign a handle in overlayfs and open it. Some readonly lower layers, such as RAFS,
+        // implement no-open semantics and return no backend handle; keep a synthetic handle 0.
+        let (layer, in_upper_layer, real_inode, backend_handle, _) =
+            node.open(ctx, flags as u32, fuse_flags)?;
+        let real_handle = backend_handle.unwrap_or_default();
 
-                self.handles.lock().unwrap().insert(hd, handle_data.clone());
-                self.inode_open_handles
-                    .lock()
-                    .unwrap()
-                    .insert(handle_data.node.inode, handle_data);
+        {
+            let hd = self.next_handle.fetch_add(1, Ordering::Relaxed);
+            let handle_data = Arc::new(HandleData {
+                node: Arc::clone(&node),
+                real_handle: Some(RealHandle {
+                    layer,
+                    in_upper_layer,
+                    inode: real_inode,
+                    handle: AtomicU64::new(real_handle),
+                }),
+            });
 
-                let mut opts = OpenOptions::empty();
-                match self.config.cache_policy {
-                    CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
-                    CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
-                    _ => {}
-                }
+            self.handles.lock().unwrap().insert(hd, handle_data.clone());
+            self.inode_open_handles
+                .lock()
+                .unwrap()
+                .insert(handle_data.node.inode, handle_data);
 
-                trace!("OPEN: returning handle: {}", hd);
-
-                Ok((Some(hd), opts, None))
+            let mut opts = OpenOptions::empty();
+            match self.config.cache_policy {
+                CachePolicy::Never => opts |= OpenOptions::DIRECT_IO,
+                CachePolicy::Always => opts |= OpenOptions::KEEP_CACHE,
+                _ => {}
             }
+
+            trace!("OPEN: returning handle: {}", hd);
+
+            Ok((Some(hd), opts, None))
         }
     }
 
