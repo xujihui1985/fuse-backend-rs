@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io;
 use std::mem::{self, size_of, ManuallyDrop, MaybeUninit};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,7 +28,126 @@ use crate::bytes_to_cstr;
 #[cfg(any(feature = "vhost-user-fs", feature = "virtiofs"))]
 use crate::transport::FsCacheReqHandler;
 
+static RENAME_WHITEOUT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
 impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
+    fn renameat2(
+        olddir_fd: RawFd,
+        oldname: &CStr,
+        newdir_fd: RawFd,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        // Safe because this doesn't modify any memory and we check the return value.
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                olddir_fd,
+                oldname.as_ptr(),
+                newdir_fd,
+                newname.as_ptr(),
+                flags,
+            )
+        };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn rename_whiteout_unsupported(e: &io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS)
+        )
+    }
+
+    fn emulate_rename_whiteout(
+        &self,
+        ctx: &Context,
+        olddir_fd: RawFd,
+        oldname: &CStr,
+        newdir_fd: RawFd,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        if flags & libc::RENAME_EXCHANGE != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+
+        let final_flags = flags & !libc::RENAME_WHITEOUT;
+        let mut tmp_name = None;
+        for _ in 0..16 {
+            let id = RENAME_WHITEOUT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+            let candidate = CString::new(format!(
+                ".fuse_rename_whiteout_{}_{}",
+                std::process::id(),
+                id
+            ))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+            match Self::renameat2(
+                olddir_fd,
+                oldname,
+                olddir_fd,
+                candidate.as_c_str(),
+                libc::RENAME_NOREPLACE,
+            ) {
+                Ok(()) => {
+                    tmp_name = Some(candidate);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+
+        let tmp_name = tmp_name.ok_or_else(|| io::Error::from_raw_os_error(libc::EEXIST))?;
+        let rollback_source = |whiteout_created: bool| {
+            if whiteout_created {
+                // Best-effort cleanup. Return the original operation error to preserve semantics.
+                unsafe {
+                    libc::unlinkat(olddir_fd, oldname.as_ptr(), 0);
+                }
+            }
+
+            let _ = Self::renameat2(olddir_fd, tmp_name.as_c_str(), olddir_fd, oldname, 0);
+        };
+
+        let create_whiteout = {
+            let (_uid, _gid) = set_creds(ctx.uid, ctx.gid)?;
+            // Safe because this doesn't modify memory and the return value is checked.
+            unsafe {
+                libc::mknodat(
+                    olddir_fd,
+                    oldname.as_ptr(),
+                    (libc::S_IFCHR | 0o000) as libc::mode_t,
+                    libc::makedev(0, 0),
+                )
+            }
+        };
+        if create_whiteout < 0 {
+            let err = io::Error::last_os_error();
+            rollback_source(false);
+            return Err(err);
+        }
+
+        match Self::renameat2(
+            olddir_fd,
+            tmp_name.as_c_str(),
+            newdir_fd,
+            newname,
+            final_flags,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                rollback_source(true);
+                Err(e)
+            }
+        }
+    }
+
     fn open_inode(&self, inode: Inode, flags: i32) -> io::Result<File> {
         let data = self.inode_map.get(inode)?;
         if !is_safe_inode(data.mode) {
@@ -286,13 +405,30 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
         inode: Inode,
         flags: libc::c_int,
     ) -> io::Result<Arc<HandleData>> {
-        let no_open = self.no_open.load(Ordering::Relaxed);
-        if !no_open {
-            self.handle_map.get(handle, inode)
-        } else {
-            let file = self.open_inode(inode, flags)?;
-            Ok(Arc::new(HandleData::new(inode, file, flags as u32)))
+        if let Ok(data) = self.handle_map.get(handle, inode) {
+            return Ok(data);
         }
+
+        if self.no_open.load(Ordering::Relaxed) {
+            if let Ok(data) = self.handle_map.get_by_inode(inode) {
+                return Ok(data);
+            }
+
+            let file = self.open_inode(inode, flags).map_err(|e| {
+                error!(
+                    "passthrough get_data open_inode failed: inode={}, handle={}, flags={}, error={}",
+                    inode, handle, flags, e
+                );
+                e
+            })?;
+            return Ok(Arc::new(HandleData::new(inode, file, flags as u32)));
+        }
+
+        error!(
+            "passthrough get_data handle miss: inode={}, handle={}, flags={}, no_open=false",
+            inode, handle, flags
+        );
+        Err(ebadf())
     }
 }
 
@@ -542,8 +678,8 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> io::Result<()> {
-        if self.no_open.load(Ordering::Relaxed) {
-            Err(enosys())
+        if self.no_open.load(Ordering::Relaxed) && self.handle_map.get(handle, inode).is_err() {
+            Ok(())
         } else {
             self.do_release(inode, handle)
         }
@@ -589,15 +725,10 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
             }
         };
 
-        let ret_handle = if !self.no_open.load(Ordering::Relaxed) {
-            let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-            let data = HandleData::new(entry.inode, file, args.flags);
-
-            self.handle_map.insert(handle, data);
-            Some(handle)
-        } else {
-            None
-        };
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let data = HandleData::new(entry.inode, file, args.flags);
+        self.handle_map.insert(handle, data);
+        let ret_handle = Some(handle);
 
         let mut opts = OpenOptions::empty();
         match self.cfg.cache_policy {
@@ -691,7 +822,13 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         flags: u32,
         fuse_flags: u32,
     ) -> io::Result<usize> {
-        let data = self.get_data(handle, inode, libc::O_RDWR)?;
+        let data = self.get_data(handle, inode, libc::O_RDWR).map_err(|e| {
+            error!(
+                "passthrough write get_data failed: inode={}, handle={}, error={}",
+                inode, handle, e
+            );
+            e
+        })?;
 
         // Manually implement File::try_clone() by borrowing fd of data.file instead of dup().
         // It's safe because the `data` variable's lifetime spans the whole function,
@@ -715,7 +852,18 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 None
             };
 
-        r.read_to(&mut *f, size as usize, offset)
+        r.read_to(&mut *f, size as usize, offset).map_err(|e| {
+            error!(
+                "passthrough write read_to failed: inode={}, handle={}, fd={}, size={}, offset={}, error={}",
+                inode,
+                handle,
+                f.as_raw_fd(),
+                size,
+                offset,
+                e
+            );
+            e
+        })
     }
 
     fn getattr(
@@ -881,7 +1029,7 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
 
     fn rename(
         &self,
-        _ctx: &Context,
+        ctx: &Context,
         olddir: Inode,
         oldname: &CStr,
         newdir: Inode,
@@ -896,23 +1044,27 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         let old_file = old_inode.get_file()?;
         let new_file = new_inode.get_file()?;
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
-        // and we have glibc 2.28.
-        let res = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                old_file.as_raw_fd(),
-                oldname.as_ptr(),
-                new_file.as_raw_fd(),
-                newname.as_ptr(),
-                flags,
-            )
-        };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        match Self::renameat2(
+            old_file.as_raw_fd(),
+            oldname,
+            new_file.as_raw_fd(),
+            newname,
+            flags,
+        ) {
+            Ok(()) => Ok(()),
+            Err(e)
+                if flags & libc::RENAME_WHITEOUT != 0 && Self::rename_whiteout_unsupported(&e) =>
+            {
+                self.emulate_rename_whiteout(
+                    ctx,
+                    old_file.as_raw_fd(),
+                    oldname,
+                    new_file.as_raw_fd(),
+                    newname,
+                    flags,
+                )
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -1042,10 +1194,6 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        if self.no_open.load(Ordering::Relaxed) {
-            return Err(enosys());
-        }
-
         let data = self.handle_map.get(handle, inode)?;
 
         // Since this method is called whenever an fd is closed in the client, we can emulate that

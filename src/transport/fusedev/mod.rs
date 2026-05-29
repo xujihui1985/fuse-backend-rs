@@ -8,9 +8,10 @@
 //! buffer and the whole reply message must be written all at once.
 
 use std::collections::VecDeque;
+use std::ffi::CStr;
 use std::io::{self, IoSlice, Write};
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
+use std::mem::{size_of, ManuallyDrop};
 use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 
@@ -19,6 +20,7 @@ use nix::unistd::write;
 use vm_memory::{ByteValued, VolatileSlice};
 
 use super::{Error, FileReadWriteVolatile, IoBuffers, Reader, Result, Writer};
+use crate::abi::fuse_abi::{NotifyInvalEntryOut, NotifyOpcode, OutHeader};
 use crate::file_buf::FileVolatileSlice;
 use crate::BitmapSlice;
 
@@ -107,6 +109,29 @@ impl<'a, S: BitmapSlice + Default> FuseDevWriter<'a, S> {
 }
 
 impl<'a, S: BitmapSlice> FuseDevWriter<'a, S> {
+    /// Notify the kernel to invalidate a cached directory entry.
+    pub fn notify_inval_entry(&self, parent: u64, name: &CStr) -> io::Result<usize> {
+        let name_with_null = name.to_bytes_with_nul();
+        let header = OutHeader {
+            len: (size_of::<OutHeader>() + size_of::<NotifyInvalEntryOut>() + name_with_null.len())
+                as u32,
+            error: NotifyOpcode::InvalEntry as i32,
+            unique: 0,
+        };
+        let entry = NotifyInvalEntryOut {
+            parent,
+            namelen: (name_with_null.len() - 1) as u32,
+            padding: 0,
+        };
+        let bufs = [
+            IoSlice::new(header.as_slice()),
+            IoSlice::new(entry.as_slice()),
+            IoSlice::new(name_with_null),
+        ];
+
+        writev(self.fd, &bufs).map_err(|e| io::Error::from_raw_os_error(e as i32))
+    }
+
     /// Split the [Writer] at the given offset.
     ///
     /// After the split, `self` will be able to write up to `offset` bytes while the returned

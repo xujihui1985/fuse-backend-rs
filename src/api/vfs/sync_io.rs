@@ -34,9 +34,10 @@ impl FileSystem for Vfs {
             } else {
                 n_opts.out_opts.remove(FsOptions::ZERO_MESSAGE_OPENDIR);
             }
-            if n_opts.no_writeback {
-                n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
-            }
+            n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
+            // if n_opts.no_writeback {
+            //     n_opts.out_opts.remove(FsOptions::WRITEBACK_CACHE);
+            // }
             if !n_opts.killpriv_v2 {
                 n_opts.out_opts.remove(FsOptions::HANDLE_KILLPRIV_V2);
             }
@@ -44,16 +45,23 @@ impl FileSystem for Vfs {
         n_opts.in_opts = opts;
 
         n_opts.out_opts &= opts;
-        self.opts.store(Arc::new(n_opts));
         {
             // Serialize mount operations. Do not expect poisoned lock here.
             // Ensure that every backend fs only get init()ed once.
             let _guard = self.lock.lock().unwrap();
             let superblocks = self.superblocks.load();
 
+            let mut backend_opts = n_opts.out_opts;
             for fs in superblocks.iter().flatten() {
-                fs.init(n_opts.out_opts)?;
+                backend_opts &= fs.init(backend_opts)?;
             }
+            n_opts.out_opts = backend_opts;
+            #[cfg(target_os = "linux")]
+            {
+                n_opts.no_open = n_opts.out_opts.contains(FsOptions::ZERO_MESSAGE_OPEN);
+                n_opts.no_opendir = n_opts.out_opts.contains(FsOptions::ZERO_MESSAGE_OPENDIR);
+            }
+            self.opts.store(Arc::new(n_opts));
             self.initialized.store(true, Ordering::Release);
         }
 

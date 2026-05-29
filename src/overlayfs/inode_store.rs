@@ -16,6 +16,8 @@ pub struct InodeStore {
     inodes: HashMap<Inode, Arc<OverlayInode>>,
     // Deleted inodes which were unlinked but have non zero lookup count.
     deleted: HashMap<Inode, Arc<OverlayInode>>,
+    // Last generation assigned to each inode number.
+    generations: HashMap<Inode, u64>,
     // Path to inode mapping, used to reserve inode number for same path.
     path_mapping: Trie<String, Inode>,
     next_inode: u64,
@@ -26,6 +28,7 @@ impl InodeStore {
         Self {
             inodes: HashMap::new(),
             deleted: HashMap::new(),
+            generations: HashMap::new(),
             path_mapping: Trie::new(),
             next_inode: 1,
         }
@@ -52,17 +55,34 @@ impl InodeStore {
     }
 
     pub(crate) fn alloc_inode(&mut self, path: &String) -> Result<Inode> {
-        match self.path_mapping.get(path) {
-            // If the path is already in the mapping, return the reserved inode number.
-            Some(v) => Ok(*v),
-            // Or allocate a new inode number.
-            None => self.alloc_unique_inode(),
+        if let Some(inode) = self.path_mapping.get(path) {
+            // Reuse the path's inode only while it is still active. If the old inode is in
+            // `deleted`, the kernel may still hold dentries for the old nodeid/generation pair.
+            if self.inodes.contains_key(inode) {
+                return Ok(*inode);
+            }
         }
+
+        self.alloc_unique_inode()
     }
 
     pub(crate) fn insert_inode(&mut self, inode: Inode, node: Arc<OverlayInode>) {
+        let generation = node.generation.load(Ordering::Relaxed);
+        if generation == 0 {
+            let generation = *self.generations.entry(inode).or_insert(1);
+            node.generation.store(generation, Ordering::Relaxed);
+        } else {
+            self.generations
+                .entry(inode)
+                .and_modify(|current| *current = (*current).max(generation))
+                .or_insert(generation);
+        }
         self.path_mapping.insert(node.path.clone(), inode);
         self.inodes.insert(inode, node);
+    }
+
+    pub(crate) fn insert_path(&mut self, inode: Inode, path: String) {
+        self.path_mapping.insert(path, inode);
     }
 
     pub(crate) fn get_inode(&self, inode: Inode) -> Option<Arc<OverlayInode>> {
@@ -79,6 +99,10 @@ impl InodeStore {
         inode: Inode,
         path_removed: Option<String>,
     ) -> Option<Arc<OverlayInode>> {
+        if let Some(path) = path_removed.as_ref() {
+            self.path_mapping.remove(path);
+        }
+
         let removed = match self.inodes.remove(&inode) {
             Some(v) => {
                 // Refcount is not 0, we have to delay the removal.
@@ -86,6 +110,7 @@ impl InodeStore {
                     self.deleted.insert(inode, v.clone());
                     return None;
                 }
+                self.retire_inode_generation(inode);
                 Some(v)
             }
             None => {
@@ -94,7 +119,11 @@ impl InodeStore {
                     Some(v) => {
                         // Refcount is 0, the inode can be removed now.
                         if v.lookups.load(Ordering::Relaxed) == 0 {
-                            self.deleted.remove(&inode)
+                            let removed = self.deleted.remove(&inode);
+                            if removed.is_some() {
+                                self.retire_inode_generation(inode);
+                            }
+                            removed
                         } else {
                             // Refcount is not 0, the inode will be removed later.
                             None
@@ -105,10 +134,16 @@ impl InodeStore {
             }
         };
 
-        if let Some(path) = path_removed {
-            self.path_mapping.remove(&path);
-        }
         removed
+    }
+
+    pub(crate) fn remove_path(&mut self, path: &String) {
+        self.path_mapping.remove(path);
+    }
+
+    fn retire_inode_generation(&mut self, inode: Inode) {
+        let generation = self.generations.entry(inode).or_insert(1);
+        *generation = generation.saturating_add(1).max(1);
     }
 
     // As a debug function, print all inode numbers in hash table.
@@ -166,7 +201,9 @@ mod test {
         store.insert_inode(1, Arc::new(node_a));
         let mut node_b = OverlayInode::new();
         node_b.path = "/b".to_string();
-        store.insert_inode(2, Arc::new(node_b));
+        let node_b = Arc::new(node_b);
+        store.insert_inode(2, node_b.clone());
+        assert_eq!(node_b.generation.load(Ordering::Relaxed), 1);
         let mut node_c = OverlayInode::new();
         node_c.path = "/c".to_string();
         store.insert_inode(VFS_MAX_INO - 1, Arc::new(node_c));
@@ -230,9 +267,14 @@ mod test {
         store.next_inode = 1;
         let inode = store.alloc_inode(&"/b".to_string()).unwrap();
         assert_eq!(inode, 2);
+        let mut node_b2 = OverlayInode::new();
+        node_b2.path = "/b".to_string();
+        let node_b2 = Arc::new(node_b2);
+        store.insert_inode(inode, node_b2.clone());
+        assert_eq!(node_b2.generation.load(Ordering::Relaxed), 2);
 
-        // Allocate inode with path "/c" will reuse its inode number.
+        // The old inode for "/c" is still in the deleted table, so a new nodeid must be used.
         let inode = store.alloc_inode(&"/c".to_string()).unwrap();
-        assert_eq!(inode, VFS_MAX_INO - 1);
+        assert_eq!(inode, 3);
     }
 }
