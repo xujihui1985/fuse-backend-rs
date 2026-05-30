@@ -11,6 +11,11 @@ use super::{Inode, OverlayInode, VFS_MAX_INO};
 
 use radix_trie::Trie;
 
+pub(crate) struct RemovedInode {
+    pub(crate) node: Arc<OverlayInode>,
+    pub(crate) was_active: bool,
+}
+
 pub struct InodeStore {
     // Active inodes.
     inodes: HashMap<Inode, Arc<OverlayInode>>,
@@ -93,12 +98,51 @@ impl InodeStore {
         self.deleted.get(&inode).cloned()
     }
 
+    pub(crate) fn inc_active_lookup(&self, inode: Inode, node: &Arc<OverlayInode>) -> Option<u64> {
+        match self.inodes.get(&inode) {
+            Some(active) if Arc::ptr_eq(active, node) => {
+                if node.lookups.load(Ordering::Acquire) == 0
+                    && node.link_paths.lock().unwrap().is_empty()
+                {
+                    return None;
+                }
+
+                Some(node.inc_lookup())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn forget_inode(&mut self, inode: Inode, count: u64) -> Option<RemovedInode> {
+        if count == 0 {
+            return None;
+        }
+
+        let node = match self.inodes.get(&inode) {
+            Some(v) => v.clone(),
+            None => match self.deleted.get(&inode) {
+                Some(v) => v.clone(),
+                None => return None,
+            },
+        };
+
+        if node.dec_lookup(count) != 0 {
+            return None;
+        }
+
+        if self.inodes.contains_key(&inode) && !node.link_paths.lock().unwrap().is_empty() {
+            return None;
+        }
+
+        self.remove_inode(inode, None)
+    }
+
     // Return the inode only if it's permanently deleted from both self.inodes and self.deleted_inodes.
     pub(crate) fn remove_inode(
         &mut self,
         inode: Inode,
         path_removed: Option<String>,
-    ) -> Option<Arc<OverlayInode>> {
+    ) -> Option<RemovedInode> {
         if let Some(path) = path_removed.as_ref() {
             self.path_mapping.remove(path);
         }
@@ -106,24 +150,30 @@ impl InodeStore {
         let removed = match self.inodes.remove(&inode) {
             Some(v) => {
                 // Refcount is not 0, we have to delay the removal.
-                if v.lookups.load(Ordering::Relaxed) > 0 {
+                if v.lookups.load(Ordering::Acquire) > 0 {
                     self.deleted.insert(inode, v.clone());
                     return None;
                 }
                 self.retire_inode_generation(inode);
-                Some(v)
+                Some(RemovedInode {
+                    node: v,
+                    was_active: true,
+                })
             }
             None => {
                 // If the inode is not in hash, it must be in deleted_inodes.
                 match self.deleted.get(&inode) {
                     Some(v) => {
                         // Refcount is 0, the inode can be removed now.
-                        if v.lookups.load(Ordering::Relaxed) == 0 {
+                        if v.lookups.load(Ordering::Acquire) == 0 {
                             let removed = self.deleted.remove(&inode);
                             if removed.is_some() {
                                 self.retire_inode_generation(inode);
                             }
-                            removed
+                            removed.map(|node| RemovedInode {
+                                node,
+                                was_active: false,
+                            })
                         } else {
                             // Refcount is not 0, the inode will be removed later.
                             None

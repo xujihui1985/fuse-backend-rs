@@ -27,7 +27,7 @@ use crate::common::file_traits::FileReadWriteVolatile;
 use vmm_sys_util::tempfile::TempFile;
 
 use self::config::{Config, WhiteoutMode};
-use self::inode_store::InodeStore;
+use self::inode_store::{InodeStore, RemovedInode};
 
 pub type Inode = u64;
 pub type Handle = u64;
@@ -670,6 +670,36 @@ impl OverlayInode {
         OverlayInode::default()
     }
 
+    pub(crate) fn inc_lookup(&self) -> u64 {
+        loop {
+            let current = self.lookups.load(Ordering::Acquire);
+            let new = current.saturating_add(1);
+
+            if self
+                .lookups
+                .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return new;
+            }
+        }
+    }
+
+    pub(crate) fn dec_lookup(&self, count: u64) -> u64 {
+        loop {
+            let current = self.lookups.load(Ordering::Acquire);
+            let new = current.saturating_sub(count);
+
+            if self
+                .lookups
+                .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return new;
+            }
+        }
+    }
+
     // Allocate new OverlayInode based on one RealInode,
     // inode number is always 0 since only OverlayFs has global unique inode allocator.
     pub fn new_from_real_inode(name: &str, ino: u64, path: String, real_inode: RealInode) -> Self {
@@ -1019,6 +1049,17 @@ impl OverlayInode {
 
     pub fn remove_child(&self, name: &str) {
         self.childrens.lock().unwrap().remove(name);
+    }
+
+    pub fn remove_child_if_same(&self, name: &str, node: &Arc<OverlayInode>) -> bool {
+        let mut childrens = self.childrens.lock().unwrap();
+        match childrens.get(name) {
+            Some(child) if Arc::ptr_eq(child, node) => {
+                childrens.remove(name);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn insert_child(&self, name: &str, node: Arc<OverlayInode>) {
@@ -1693,8 +1734,15 @@ impl OverlayFs {
             .ok_or_else(|| Error::from_raw_os_error(libc::ENOENT))
     }
 
+    fn inc_active_lookup(&self, node: &Arc<OverlayInode>) -> Option<u64> {
+        self.inodes
+            .read()
+            .unwrap()
+            .inc_active_lookup(node.inode, node)
+    }
+
     // Return the inode only if it's permanently deleted from both self.inodes and self.deleted_inodes.
-    fn remove_inode(&self, inode: u64, path_removed: Option<String>) -> Option<Arc<OverlayInode>> {
+    fn remove_inode(&self, inode: u64, path_removed: Option<String>) -> Option<RemovedInode> {
         self.inodes
             .write()
             .unwrap()
@@ -1814,53 +1862,27 @@ impl OverlayFs {
     }
 
     fn forget_one(&self, inode: Inode, count: u64) {
-        if inode == self.root_inode() || inode == 0 {
+        if inode == self.root_inode() || inode == 0 || count == 0 {
             return;
         }
 
-        let v = match self.get_all_inode(inode) {
-            Some(n) => n,
-            None => {
-                trace!("forget unknown inode: {}", inode);
-                return;
-            }
+        let removed = {
+            let mut inode_store = self.inodes.write().unwrap();
+            inode_store.forget_inode(inode, count)
         };
 
-        // FIXME: need atomic protection around lookups' load & store. @weizhang555
-        let mut lookups = v.lookups.load(Ordering::Relaxed);
-
-        if lookups < count {
-            lookups = 0;
-        } else {
-            lookups -= count;
-        }
-        v.lookups.store(lookups, Ordering::Relaxed);
-
-        // TODO: use compare_exchange.
-        //v.lookups.compare_exchange(old, new, Ordering::Acquire, Ordering::Relaxed);
-
-        if lookups == 0 {
-            let linked_paths = v.link_paths.lock().unwrap().len();
-            if linked_paths > 0 {
-                trace!(
-                    "keep cached inode {} with {} live path(s) after forget",
-                    inode,
-                    linked_paths
-                );
-                return;
-            }
-
-            debug!("inode is forgotten: {}, name {}", inode, v.name);
-            let _ = self.remove_inode(inode, None);
-            let parent = v.parent.lock().unwrap();
-
-            if let Some(p) = parent.upgrade() {
-                // Only remove the parent's entry if it still points at this inode.
-                if p.child(v.name.as_str())
-                    .is_some_and(|child| Arc::ptr_eq(&child, &v))
-                {
-                    p.remove_child(v.name.as_str());
+        match removed {
+            Some(removed) => {
+                debug!("inode is forgotten: {}, name {}", inode, removed.node.name);
+                if removed.was_active {
+                    let parent = removed.node.parent.lock().unwrap();
+                    if let Some(p) = parent.upgrade() {
+                        p.remove_child_if_same(removed.node.name.as_str(), &removed.node);
+                    }
                 }
+            }
+            None => {
+                trace!("forget unknown, referenced, or linked inode: {}", inode);
             }
         }
     }
@@ -1879,9 +1901,10 @@ impl OverlayFs {
             self.load_directory(ctx, &node)?;
         }
 
-        // FIXME: can forget happen between found and increase reference counter?
-        let tmp = node.lookups.fetch_add(1, Ordering::Relaxed);
-        trace!("lookup count: {}", tmp + 1);
+        let lookups = self
+            .inc_active_lookup(&node)
+            .ok_or_else(|| Error::from_raw_os_error(libc::ENOENT))?;
+        trace!("lookup count: {}", lookups);
         Ok(Entry {
             inode: node.inode,
             generation: node.generation.load(Ordering::Relaxed),
@@ -1989,7 +2012,10 @@ impl OverlayFs {
                 };
 
                 let entry = if is_readdirplus {
-                    child.lookups.fetch_add(1, Ordering::Relaxed);
+                    if self.inc_active_lookup(&child).is_none() {
+                        continue;
+                    }
+
                     Some(Entry {
                         inode: child.inode,
                         generation: child.generation.load(Ordering::Relaxed),
@@ -2358,11 +2384,11 @@ impl OverlayFs {
                     Ok(false)
                 })?;
 
-                n.lookups.fetch_sub(1, Ordering::Relaxed);
-                self.remove_inode(n.inode, Some(new_path.clone()));
+                n.dec_lookup(1);
+                let _ = self.remove_inode(n.inode, Some(new_path.clone()));
                 new_parent.remove_child(name);
 
-                src_node.lookups.fetch_add(1, Ordering::Relaxed);
+                src_node.inc_lookup();
                 src_node.add_link_path(new_path.clone());
                 self.insert_path_mapping(src_node.inode, new_path);
                 new_parent.insert_child(name, src_node);
@@ -2381,7 +2407,7 @@ impl OverlayFs {
                     Ok(false)
                 })?;
 
-                src_node.lookups.fetch_add(1, Ordering::Relaxed);
+                src_node.inc_lookup();
                 src_node.add_link_path(new_path.clone());
                 self.insert_path_mapping(src_node.inode, new_path);
                 new_parent.insert_child(name, src_node);
@@ -2563,8 +2589,8 @@ impl OverlayFs {
 
         if old_is_dir {
             if let Some(target) = target_node {
-                target.lookups.fetch_sub(1, Ordering::Relaxed);
-                self.remove_inode(target.inode, Some(target.path.clone()));
+                target.dec_lookup(1);
+                let _ = self.remove_inode(target.inode, Some(target.path.clone()));
                 new_parent.remove_child(newname);
             }
 
@@ -2585,9 +2611,9 @@ impl OverlayFs {
                         })?;
                         target.add_upper_inode(moved_real_inode, true);
                     } else {
-                        target.lookups.fetch_sub(1, Ordering::Relaxed);
+                        target.dec_lookup(1);
                         if target.remove_link_path(&moved_path) == 0 {
-                            self.remove_inode(target.inode, Some(moved_path.clone()));
+                            let _ = self.remove_inode(target.inode, Some(moved_path.clone()));
                         } else {
                             self.remove_path_mapping(&moved_path);
                         }
@@ -2598,16 +2624,16 @@ impl OverlayFs {
 
             old_parent.remove_child(oldname);
             if target_reused_inode {
-                old_node.lookups.fetch_sub(1, Ordering::Relaxed);
+                old_node.dec_lookup(1);
                 if old_node.remove_link_path(&old_path) == 0 {
-                    self.remove_inode(old_node.inode, Some(old_path.clone()));
+                    let _ = self.remove_inode(old_node.inode, Some(old_path.clone()));
                 } else {
                     self.remove_path_mapping(&old_path);
                 }
             } else if preserve_target_inode {
-                old_node.lookups.fetch_sub(1, Ordering::Relaxed);
+                old_node.dec_lookup(1);
                 if old_node.remove_link_path(&old_path) == 0 {
-                    self.remove_inode(old_node.inode, Some(old_path.clone()));
+                    let _ = self.remove_inode(old_node.inode, Some(old_path.clone()));
                 } else {
                     self.remove_path_mapping(&old_path);
                 }
@@ -3030,10 +3056,10 @@ impl OverlayFs {
         );
 
         // lookups decrease by 1.
-        node.lookups.fetch_sub(1, Ordering::Relaxed);
+        node.dec_lookup(1);
 
         if node.remove_link_path(&path_removed) == 0 {
-            self.remove_inode(node.inode, Some(path_removed.clone()));
+            let _ = self.remove_inode(node.inode, Some(path_removed.clone()));
         } else {
             self.remove_path_mapping(&path_removed);
         }
@@ -3149,9 +3175,9 @@ impl OverlayFs {
                 }
 
                 let child_path = format!("{}/{}", node.path, name);
-                child.lookups.fetch_sub(1, Ordering::Relaxed);
+                child.dec_lookup(1);
                 if child.remove_link_path(&child_path) == 0 {
-                    self.remove_inode(child.inode, Some(child_path.clone()));
+                    let _ = self.remove_inode(child.inode, Some(child_path.clone()));
                 } else {
                     self.remove_path_mapping(&child_path);
                 }
