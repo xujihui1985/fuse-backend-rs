@@ -1871,19 +1871,17 @@ impl OverlayFs {
             inode_store.forget_inode(inode, count)
         };
 
-        match removed {
-            Some(removed) => {
-                debug!("inode is forgotten: {}, name {}", inode, removed.node.name);
-                if removed.was_active {
-                    let parent = removed.node.parent.lock().unwrap();
-                    if let Some(p) = parent.upgrade() {
-                        p.remove_child_if_same(removed.node.name.as_str(), &removed.node);
-                    }
-                }
-            }
-            None => {
-                trace!("forget unknown, referenced, or linked inode: {}", inode);
-            }
+        let Some(removed) = removed else {
+            trace!("forget unknown, referenced, or linked inode: {}", inode);
+            return;
+        };
+
+        if !removed.was_active {
+            return;
+        }
+
+        if let Some(parent) = removed.node.parent.lock().unwrap().upgrade() {
+            parent.remove_child_if_same(removed.node.name.as_str(), &removed.node);
         }
     }
 
