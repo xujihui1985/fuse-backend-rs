@@ -1079,6 +1079,10 @@ impl OverlayInode {
         link_paths.len()
     }
 
+    pub fn link_path_count(&self) -> usize {
+        self.link_paths.lock().unwrap().len()
+    }
+
     pub fn handle_upper_inode_locked(
         &self,
         f: &mut dyn FnMut(Option<&RealInode>) -> Result<bool>,
@@ -1880,7 +1884,8 @@ impl OverlayFs {
             return;
         }
 
-        if let Some(parent) = removed.node.parent.lock().unwrap().upgrade() {
+        let parent_inode = removed.node.parent.lock().unwrap();
+        if let Some(parent) = parent_inode.upgrade() {
             parent.remove_child_if_same(removed.node.name.as_str(), &removed.node);
         }
     }
@@ -2579,6 +2584,7 @@ impl OverlayFs {
             .map(|target| target.inode == old_node.inode)
             .unwrap_or(false);
         let preserve_target_inode = !old_is_dir
+            && old_node.link_path_count() > 1
             && is_kernel_overlay_work_temp_rename(&old_parent.path, oldname)
             && target_node
                 .as_ref()
