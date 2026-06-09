@@ -157,7 +157,11 @@ impl<S: BitmapSlice + Send + Sync> PassthroughFs<S> {
             if !self.cfg.allow_direct_io && flags & libc::O_DIRECT != 0 {
                 new_flags &= !libc::O_DIRECT;
             }
-            data.open_file(new_flags | libc::O_CLOEXEC, &self.proc_self_fd)
+            let file = data.open_file(new_flags | libc::O_CLOEXEC, &self.proc_self_fd)?;
+            if stat_fd(&file, None)?.st_nlink == 0 {
+                return Err(io::Error::from_raw_os_error(libc::ENOENT));
+            }
+            Ok(file)
         }
     }
 
@@ -1129,11 +1133,32 @@ impl<S: BitmapSlice + Send + Sync> FileSystem for PassthroughFs<S> {
                 libc::AT_EMPTY_PATH,
             )
         };
-        if res == 0 {
-            self.do_lookup(newparent, newname)
-        } else {
-            Err(io::Error::last_os_error())
+        if res != 0 {
+            let err = io::Error::last_os_error();
+            if !matches!(
+                err.raw_os_error(),
+                Some(libc::ENOENT | libc::EPERM | libc::EACCES)
+            ) {
+                return Err(err);
+            }
+
+            let proc_name = CString::new(format!("{}", file.as_raw_fd()))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let res = unsafe {
+                libc::linkat(
+                    self.proc_self_fd.as_raw_fd(),
+                    proc_name.as_ptr(),
+                    new_file.as_raw_fd(),
+                    newname.as_ptr(),
+                    libc::AT_SYMLINK_FOLLOW,
+                )
+            };
+            if res != 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
+
+        self.do_lookup(newparent, newname)
     }
 
     fn symlink(

@@ -730,10 +730,6 @@ impl OverlayInode {
         for ri in real_inodes {
             let whiteout = ri.whiteout;
             let opaque = ri.opaque;
-            let stat = match ri.stat {
-                Some(v) => v,
-                None => ri.stat64(&Context::default())?,
-            };
 
             if first {
                 first = false;
@@ -741,11 +737,6 @@ impl OverlayInode {
 
                 // This is whiteout, no need to check lower layers.
                 if whiteout {
-                    break;
-                }
-
-                // A non-directory file shadows all lower layers as default.
-                if !utils::is_dir(stat) {
                     break;
                 }
 
@@ -759,14 +750,8 @@ impl OverlayInode {
                     break;
                 }
 
-                // Only directory have multiple real inodes, so if this is non-first real-inode
-                // and it's not directory, it should indicates some invalid layout. @weizhang555
-                if !utils::is_dir(stat) {
-                    error!("invalid layout: non-directory has multiple real inodes");
-                    break;
-                }
-
-                // Valid directory.
+                // Keep shadowed lower non-directories so stale upper inode handling can fall
+                // through to lower layers, and so whiteout decisions know a lower exists.
                 new.real_inodes.lock().unwrap().push(ri);
                 // Opaque directory shadows all lower layers.
                 if opaque {
@@ -1151,7 +1136,7 @@ fn is_kernel_overlay_work_temp_rename(parent_path: &str, name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::abi::fuse_abi::{CreateIn, ROOT_ID};
-    use crate::api::filesystem::{Context, FileSystem, Layer};
+    use crate::api::filesystem::{Context, FileSystem};
     use crate::passthrough::{self, PassthroughFs};
     use std::ffi::CString;
     use vmm_sys_util::tempdir::TempDir;
@@ -1189,6 +1174,49 @@ mod tests {
         }
 
         entry
+    }
+
+    fn mkdir_at(fs: &OverlayFs, ctx: &Context, parent: Inode, name: &str) -> Entry {
+        fs.mkdir(ctx, parent, &CString::new(name).unwrap(), 0o755, 0)
+            .unwrap()
+    }
+
+    fn create_file(fs: &OverlayFs, ctx: &Context, parent: Inode, name: &str) -> Entry {
+        let (entry, handle, _, _) = fs
+            .create(
+                ctx,
+                parent,
+                &CString::new(name).unwrap(),
+                CreateIn::default(),
+            )
+            .unwrap();
+        if let Some(handle) = handle {
+            fs.release(ctx, entry.inode, 0, handle, false, false, None)
+                .unwrap();
+        }
+
+        entry
+    }
+
+    fn prepare_kernel_overlay_workdir(fs: &OverlayFs, ctx: &Context) -> Entry {
+        let work = mkdir_at(fs, ctx, ROOT_ID, "work");
+        mkdir_at(fs, ctx, work.inode, "work")
+    }
+
+    #[test]
+    fn test_kernel_overlay_work_temp_rename_classifier() {
+        assert!(is_kernel_overlay_work_temp_rename("/work", "#1a"));
+        assert!(is_kernel_overlay_work_temp_rename("/work/work", "#15ea"));
+        assert!(is_kernel_overlay_work_temp_rename(
+            "/work/work/nested",
+            "#ABCDEF"
+        ));
+
+        assert!(!is_kernel_overlay_work_temp_rename("/fs/work", "#1a"));
+        assert!(!is_kernel_overlay_work_temp_rename("/workdir", "#1a"));
+        assert!(!is_kernel_overlay_work_temp_rename("/work", "1a"));
+        assert!(!is_kernel_overlay_work_temp_rename("/work", "#"));
+        assert!(!is_kernel_overlay_work_temp_rename("/work", "#tmp"));
     }
 
     #[test]
@@ -1465,6 +1493,78 @@ mod tests {
             .unwrap();
         let st = fs.getattr(&ctx, child.inode, None).unwrap().0;
         assert!(utils::is_dir(st));
+    }
+
+    #[test]
+    fn test_kernel_overlay_singleton_work_rename_uses_source_inode() {
+        let (fs, _upper, _lower) = prepare_overlayfs();
+        let ctx = Context::default();
+
+        let work_work = prepare_kernel_overlay_workdir(&fs, &ctx);
+        let fs_dir = mkdir_at(&fs, &ctx, ROOT_ID, "fs");
+        let var = mkdir_at(&fs, &ctx, fs_dir.inode, "var");
+        let log = mkdir_at(&fs, &ctx, var.inode, "log");
+        let apt = mkdir_at(&fs, &ctx, log.inode, "apt");
+
+        let target = create_file(&fs, &ctx, apt.inode, "eipp.log.xz");
+        let source = create_file(&fs, &ctx, work_work.inode, "#15ea");
+
+        fs.rename(
+            &ctx,
+            work_work.inode,
+            &CString::new("#15ea").unwrap(),
+            apt.inode,
+            &CString::new("eipp.log.xz").unwrap(),
+            0,
+        )
+        .unwrap();
+        fs.forget(&ctx, target.inode, 1);
+        fs.forget(&ctx, source.inode, 1);
+
+        let renamed = fs
+            .lookup(&ctx, apt.inode, &CString::new("eipp.log.xz").unwrap())
+            .unwrap();
+        assert_eq!(renamed.inode, source.inode);
+        assert_ne!(renamed.inode, target.inode);
+        fs.getattr(&ctx, source.inode, None).unwrap();
+    }
+
+    #[test]
+    fn test_kernel_overlay_multilink_work_rename_preserves_target_inode() {
+        let (fs, _upper, _lower) = prepare_overlayfs();
+        let ctx = Context::default();
+
+        let work_work = prepare_kernel_overlay_workdir(&fs, &ctx);
+        let fs_dir = mkdir_at(&fs, &ctx, ROOT_ID, "fs");
+        let var = mkdir_at(&fs, &ctx, fs_dir.inode, "var");
+        let lib = mkdir_at(&fs, &ctx, var.inode, "lib");
+        let dpkg = mkdir_at(&fs, &ctx, lib.inode, "dpkg");
+
+        let target = create_file(&fs, &ctx, dpkg.inode, "status-old");
+        let source = create_file(&fs, &ctx, work_work.inode, "#15eb");
+        let source_node = fs.lookup_node(&ctx, work_work.inode, "#15eb").unwrap();
+        // The branch under test only depends on overlay inode link-path accounting.
+        source_node.add_link_path("/work/work/#15ec".to_string());
+
+        fs.rename(
+            &ctx,
+            work_work.inode,
+            &CString::new("#15eb").unwrap(),
+            dpkg.inode,
+            &CString::new("status-old").unwrap(),
+            0,
+        )
+        .unwrap();
+        fs.forget(&ctx, source.inode, 1);
+        fs.forget(&ctx, target.inode, 1);
+
+        let renamed = fs
+            .lookup(&ctx, dpkg.inode, &CString::new("status-old").unwrap())
+            .unwrap();
+        assert_eq!(renamed.inode, target.inode);
+        assert_ne!(renamed.inode, source.inode);
+        fs.getattr(&ctx, target.inode, None).unwrap();
+        fs.getattr(&ctx, source.inode, None).unwrap();
     }
 
     #[test]
